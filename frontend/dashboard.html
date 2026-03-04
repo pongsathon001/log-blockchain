@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>Employee Data Auditor Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background: #f0f2f5; padding: 40px; }
+        .container { max-width: 1000px; margin: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        th, td { padding: 15px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #007bff; color: white; }
+        .status-badge { padding: 5px 12px; border-radius: 20px; font-size: 0.85em; font-weight: bold; }
+        .status-ok { background: #d4edda; color: #155724; }
+        .status-warn { background: #f8d7da; color: #721c24; animation: blink 1s infinite; }
+        @keyframes blink { 50% { opacity: 0.5; } }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="header">
+        <h1>📊 Employee Audit Dashboard</h1>
+        <button onclick="auditAll()" style="padding: 10px 20px; cursor: pointer;">🔍 Run Audit Now</button>
+    </div>
+
+    <table id="employeeTable">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>ชื่อ-นามสกุล</th>
+                <th>ตำแหน่ง</th>
+                <th>เงินเดือน (MySQL)</th>
+                <th>สถานะ Integrity</th>
+            </tr>
+        </thead>
+        <tbody>
+            </tbody>
+    </table>
+</div>
+
+<script>
+    const CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+    const ABI = ["function getLog(string memory _logId) public view returns (string memory, uint256, address)"];
+
+    async function auditAll() {
+        const provider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
+        const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
+        
+        // 1. ดึงข้อมูลจาก MySQL ผ่าน API
+        const response = await fetch('http://localhost:3000/api/employees');
+        const employees = await response.json();
+        
+        const tbody = document.querySelector('#employeeTable tbody');
+        tbody.innerHTML = '';
+
+        for (let emp of employees) {
+            // 2. คำนวณ Hash ปัจจุบันจาก DB
+            const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}`;
+            const msgBuffer = new TextEncoder().encode(dataString);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const currentHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+            let statusHtml = '';
+            try {
+                // 3. เทียบกับ Blockchain
+                const [onChainHash] = await contract.getLog(`EMP_DB_${emp.id}`);
+                if (onChainHash === currentHash) {
+                    statusHtml = '<span class="status-badge status-ok">✅ ปกติ</span>';
+                } else {
+                    statusHtml = '<span class="status-badge status-warn">❌ ถูกแก้ไข!</span>';
+                }
+            } catch (e) {
+                statusHtml = '<span class="status-badge">⚠️ ยังไม่เข้าระบบ</span>';
+            }
+
+            tbody.innerHTML += `
+                <tr>
+                    <td>${emp.id}</td>
+                    <td>${emp.name}</td>
+                    <td>${emp.position}</td>
+                    <td>${Number(emp.salary).toLocaleString()} ฿</td>
+                    <td>${statusHtml}</td>
+                </tr>
+            `;
+        }
+    }
+
+    // เพิ่มตัวแปรเช็คการแจ้งเตือนไว้ด้านบนสุดของสคริปต์
+let alertTriggered = false;
+
+async function auditAll() {
+    const provider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
+    const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
+    
+    try {
+        // 1. ดึงข้อมูลจาก MySQL ผ่าน API (ต้องใส่ await และเก็บค่าลงตัวแปรชื่อ employees)
+        const response = await fetch('http://localhost:3000/api/employees');
+        const employees = await response.json(); // <--- จุดที่ต้องมีบรรทัดนี้!
+        
+        const tbody = document.querySelector('#employeeTable tbody');
+        tbody.innerHTML = '';
+        let alertTriggered = false;
+
+        // 2. เริ่มวนลูปข้อมูลที่ได้มา
+        for (let emp of employees) {
+            // คำนวณ Hash ปัจจุบันจากข้อมูลในแถวนั้นๆ
+            const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}`;
+            const msgBuffer = new TextEncoder().encode(dataString);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const currentHash = Array.from(new Uint8Array(hashBuffer))
+                                     .map(b => b.toString(16).padStart(2, '0'))
+                                     .join('');
+
+            let statusHtml = '';
+            try {
+                // เทียบกับ Blockchain
+                const [onChainHash] = await contract.getLog(`EMP_DB_${emp.id}`);
+                if (onChainHash === currentHash) {
+                    statusHtml = '<span class="status-badge status-ok">✅ ปกติ</span>';
+                } else {
+                    statusHtml = '<span class="status-badge status-warn">❌ ถูกแก้ไข!</span>';
+                    alertTriggered = true;
+                }
+            } catch (e) {
+                statusHtml = '<span class="status-badge">⚠️ ยังไม่เข้าระบบ</span>';
+            }
+
+            // เพิ่มแถวลงในตาราง
+            tbody.innerHTML += `
+                <tr>
+                    <td>${emp.id}</td>
+                    <td>${emp.name}</td>
+                    <td>${emp.position}</td>
+                    <td>${Number(emp.salary).toLocaleString()} ฿</td>
+                    <td>${statusHtml}</td>
+                </tr>
+            `;
+        }
+
+        // ระบบแจ้งเตือน
+        if (alertTriggered) {
+            alert("🚨 ตรวจพบการบุกรุก! ข้อมูลบางส่วนถูกแก้ไข!");
+        }
+
+    } catch (error) {
+        console.error("เกิดข้อผิดพลาด:", error);
+        alert("ไม่สามารถเชื่อมต่อ API Server ได้ (ลืมรัน node server.js หรือเปล่า?)");
+    }
+}
+</script>
+</body>
+</html>
