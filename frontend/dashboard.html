@@ -149,6 +149,25 @@ async function auditAll() {
         alert("ไม่สามารถเชื่อมต่อ API Server ได้ (ลืมรัน node server.js หรือเปล่า?)");
     }
 }
+
+// ... โค้ดส่วนบนเดิม ...
+
+async function auditAll() {
+    console.log("🔄 Starting Auto-Audit...");
+    // ... โค้ดดึงข้อมูลและเปรียบเทียบเดิม ...
+    
+    // เพิ่มการโชว์เวลาที่ตรวจสอบล่าสุด
+    const header = document.querySelector('.header h1');
+    header.innerHTML = `📊 Employee Audit Dashboard <small style="font-size:0.4em; color:gray;">Last Audit: ${new Date().toLocaleTimeString()}</small>`;
+}
+
+// เรียกใช้งานครั้งแรกทันทีที่เปิดหน้าเว็บ
+auditAll();
+
+// ตั้งเวลาให้รันอัตโนมัติทุก 10 วินาที (10000 ms)
+setInterval(auditAll, 10000); 
+
+// ... โค้ดส่วนล่างเดิม ...
 </script>
 </body>
 </html>
