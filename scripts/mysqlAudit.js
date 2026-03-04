@@ -1,18 +1,24 @@
+require('dotenv').config(); // ดึงค่าจากไฟล์ .env
 const mysql = require('mysql2/promise');
 const hre = require("hardhat");
 const crypto = require("crypto");
 
 async function main() {
-    // 1. ตั้งค่าการเชื่อมต่อ MySQL (แก้ user/password ให้ตรงกับเครื่องคุณ)
+    // 1. ตั้งค่าการเชื่อมต่อ MySQL (ดึงจาก .env)
     const db = await mysql.createConnection({
-        host: 'localhost',
-        user: 'root', 
-        password: '1234', // ใส่รหัสผ่าน MySQL ของคุณ
-        database: 'company_db'
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'root', 
+        password: process.env.DB_PASS || '1234', 
+        database: process.env.DB_NAME || 'company_db'
     });
 
-    // 2. ใส่ Address ล่าสุดที่คุณได้จากการรัน npx hardhat run scripts/deploy.js
-    const CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+    // 2. ดึง Address จากไฟล์ .env อัตโนมัติ
+    const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS; 
+    
+    if (!CONTRACT_ADDRESS) {
+        throw new Error("❌ หา CONTRACT_ADDRESS ไม่เจอ! ตรวจสอบไฟล์ .env ว่ามีค่ายัง");
+    }
+
     const [signer] = await hre.ethers.getSigners();
     const LogStorage = await hre.ethers.getContractAt("LogStorage", CONTRACT_ADDRESS, signer);
 

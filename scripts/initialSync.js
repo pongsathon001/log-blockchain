@@ -4,14 +4,20 @@ const crypto = require("crypto");
 require('dotenv').config();
 
 async function main() {
+    // 1. เพิ่ม Fallback ให้กับ Database เผื่อไฟล์ .env อ่านค่าไม่ได้
     const db = await mysql.createConnection({
-        host: process.env.DB_HOST,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASS,
-        database: process.env.DB_NAME
+        host: process.env.DB_HOST || 'localhost',
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASS || '1234',
+        database: process.env.DB_NAME || 'company_db'
     });
 
+    // 2. ดึง Contract Address จาก .env
     const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+    if (!CONTRACT_ADDRESS) {
+        throw new Error("❌ หา CONTRACT_ADDRESS ไม่เจอ! ตรวจสอบไฟล์ .env ด่วน");
+    }
+
     const [signer] = await hre.ethers.getSigners();
     const LogStorage = await hre.ethers.getContractAt("LogStorage", CONTRACT_ADDRESS, signer);
 

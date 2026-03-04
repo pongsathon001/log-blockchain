@@ -1,10 +1,15 @@
-require('dotenv').config(); // เพิ่มบรรทัดนี้ที่บนสุด
+require('dotenv').config(); 
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
 const app = express();
 
 app.use(cors());
+
+// 👇 [ส่วนที่เพิ่มใหม่] สร้าง API ให้หน้าเว็บมาดึง Contract Address จาก .env
+app.get('/api/config', (req, res) => {
+    res.json({ contractAddress: process.env.CONTRACT_ADDRESS });
+});
 
 app.get('/api/employees', async (req, res) => {
     try {
