@@ -4,7 +4,6 @@ const crypto = require("crypto");
 require('dotenv').config();
 
 async function main() {
-    // 1. เพิ่ม Fallback ให้กับ Database เผื่อไฟล์ .env อ่านค่าไม่ได้
     const db = await mysql.createConnection({
         host: process.env.DB_HOST || 'localhost',
         user: process.env.DB_USER || 'root',
@@ -12,7 +11,6 @@ async function main() {
         database: process.env.DB_NAME || 'company_db'
     });
 
-    // 2. ดึง Contract Address จาก .env
     const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
     if (!CONTRACT_ADDRESS) {
         throw new Error("❌ หา CONTRACT_ADDRESS ไม่เจอ! ตรวจสอบไฟล์ .env ด่วน");
@@ -21,43 +19,49 @@ async function main() {
     const [signer] = await hre.ethers.getSigners();
     const LogStorage = await hre.ethers.getContractAt("LogStorage", CONTRACT_ADDRESS, signer);
 
-    const [rows] = await db.execute('SELECT * FROM employees');
-    console.log(`📦 เตรียมบันทึกพนักงานจำนวน ${rows.length} รายการแบบ Batch...`);
+    // 1. ดึงข้อมูลพนักงานมาเรียงลำดับ (สำคัญมากสำหรับ Hash Chain)
+    const [rows] = await db.execute('SELECT * FROM employees ORDER BY id ASC');
+    console.log(`📦 เตรียมร้อยโซ่ (Hash Chain) พนักงาน ${rows.length} รายการ...`);
 
     let idsToStore = [];
     let hashesToStore = [];
+    let previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
 
+    // 2. คำนวณ Hash Chain และเตรียม Query สำหรับอัปเดต MySQL
     for (const emp of rows) {
-        const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}`;
-        const currentHash = crypto.createHash("sha256").update(dataString).digest("hex");
         const logId = `EMP_DB_${emp.id}`;
+        
+        // สูตร: SHA256(ข้อมูล + Hash คนก่อนหน้า)
+        const dataToHash = `${emp.id}${emp.name}${emp.position}${emp.salary}${previousHash}`;
+        const currentHash = crypto.createHash("sha256").update(dataToHash).digest("hex");
 
-        try {
-            // เช็คก่อนว่ามีในระบบหรือยัง โดยดึงค่า Hash มาดู
-            const [onChainHash] = await LogStorage.getLog(logId);
-            
-            // 💡 ถ้าค่าที่ดึงมาว่างเปล่า (Empty String) แปลว่ายังไม่เคยบันทึก
-            if (!onChainHash || onChainHash === "") {
-                idsToStore.push(logId);
-                hashesToStore.push(currentHash);
-            }
-        } catch (error) {
-            // เผื่อไว้กรณี Blockchain โยน Error กลับมา ก็ให้ถือว่ายังไม่มีข้อมูลเช่นกัน
-            idsToStore.push(logId);
-            hashesToStore.push(currentHash);
-        }
+        idsToStore.push(logId);
+        hashesToStore.push(currentHash);
+
+        // 📝 อัปเดตค่า Hash ลงใน MySQL ทันที
+        await db.execute('UPDATE employees SET stored_hash = ? WHERE id = ?', [currentHash, emp.id]);
+
+        previousHash = currentHash;
+        console.log(`⛓️  Linked: ${logId} -> MySQL Updated`);
     }
 
+    // 3. ส่งข้อมูลขึ้น Blockchain
     if (idsToStore.length > 0) {
-        console.log(`🚀 กำลังส่ง ${idsToStore.length} รายการขึ้น Blockchain...`);
-        const tx = await LogStorage.batchStoreLogs(idsToStore, hashesToStore); // เรียกใช้ฟังก์ชัน Batch
-        await tx.wait(); // รอจนกว่านักขุดจะยืนยันข้อมูล
-        console.log(`✅ บันทึกข้อมูลพนักงานทั้งหมดสำเร็จ!`);
-    } else {
-        console.log("ℹ️ ข้อมูลทั้งหมดอยู่ใน Blockchain เรียบร้อยแล้ว");
+        console.log(`\n🚀 กำลังส่ง Batch Chain ขึ้น Blockchain (Sepolia)...`);
+        
+        const tx = await LogStorage.batchStoreChain(idsToStore, hashesToStore);
+        console.log(`⏳ รอการยืนยัน Transaction: ${tx.hash}`);
+        await tx.wait();
+        
+        const finalRoot = await LogStorage.lastRootHash();
+        console.log(`✅ สำเร็จ! Root Hash บน Blockchain: ${finalRoot}`);
+        console.log(`✅ ข้อมูลใน MySQL และ Blockchain ตรงกันแล้ว 100%`);
     }
 
     await db.end();
 }
 
-main().catch((error) => { console.error(error); process.exitCode = 1; });
+main().catch((error) => { 
+    console.error("❌ เกิดข้อผิดพลาด:", error); 
+    process.exitCode = 1; 
+});

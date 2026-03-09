@@ -2,28 +2,33 @@
 <html lang="th">
 <head>
     <meta charset="UTF-8">
-    <title>Employee Data Auditor Dashboard</title>
+    <title>Employee Hash Chain Auditor</title>
     <link rel="icon" href="data:,">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
     <style>
         body { font-family: 'Inter', sans-serif; background: #f0f2f5; padding: 40px; }
-        .container { max-width: 1000px; margin: auto; }
+        .container { max-width: 1100px; margin: auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
         table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
         th, td { padding: 15px; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: #007bff; color: white; }
-        .status-badge { padding: 5px 12px; border-radius: 20px; font-size: 0.85em; font-weight: bold; }
+        th { background: #1a2a6c; color: white; }
+        .status-badge { padding: 5px 12px; border-radius: 20px; font-size: 0.85em; font-weight: bold; display: inline-block; }
         .status-ok { background: #d4edda; color: #155724; }
-        .status-warn { background: #f8d7da; color: #721c24; animation: blink 1s infinite; }
+        .status-warn { background: #f8d7da; color: #721c24; animation: blink 0.8s infinite; }
+        .status-broken { background: #fff3cd; color: #856404; } /* สถานะโซ่ขาด */
         @keyframes blink { 50% { opacity: 0.5; } }
+        .chain-link { color: #007bff; font-family: monospace; font-size: 0.8em; }
     </style>
 </head>
 <body>
 
 <div class="container">
     <div class="header">
-        <h1>📊 Employee Audit Dashboard</h1>
-        <button onclick="auditAll()" style="padding: 10px 20px; cursor: pointer;">🔍 Run Audit Now</button>
+        <div>
+            <h1>🔗 Employee Hash Chain Auditor</h1>
+            <p id="lastUpdate" style="color: gray; margin: 0;"></p>
+        </div>
+        <button onclick="auditAll()" style="padding: 12px 25px; cursor: pointer; background: #1a2a6c; color: white; border: none; border-radius: 5px;">🔍 Run Chain Audit</button>
     </div>
 
     <table id="employeeTable">
@@ -31,98 +36,95 @@
             <tr>
                 <th>ID</th>
                 <th>ชื่อ-นามสกุล</th>
-                <th>ตำแหน่ง</th>
                 <th>เงินเดือน (MySQL)</th>
+                <th>Hash (Current)</th>
                 <th>สถานะ Integrity</th>
             </tr>
         </thead>
         <tbody>
+            <tr><td colspan="5" style="text-align:center;">กำลังโหลดข้อมูล...</td></tr>
         </tbody>
     </table>
 </div>
 
 <script>
-    const ABI = ["function getLog(string memory _logId) public view returns (string memory, uint256, address)"];
+    const ABI = ["function getLog(string memory _logId) public view returns (string memory, uint256, address, uint256)"];
 
     async function auditAll() {
-        console.log("🔄 กำลังตรวจสอบข้อมูล (Auto-Audit)...");
         const tbody = document.querySelector('#employeeTable tbody');
         
         try {
-            // 1. ไปถามหา Contract Address และ RPC URL จาก API ของ Server
             const configResponse = await fetch('http://localhost:3000/api/config');
-            if (!configResponse.ok) throw new Error("ไม่สามารถดึงค่า Config จาก Server ได้");
             const config = await configResponse.json();
-            const CONTRACT_ADDRESS = config.contractAddress;
-            const RPC_URL = config.rpcUrl; // 👈 [แก้ไข] รับค่า rpcUrl จาก API
+            const { contractAddress: CONTRACT_ADDRESS, rpcUrl: RPC_URL } = config;
 
-            if (!CONTRACT_ADDRESS || !RPC_URL) {
-                throw new Error("หา Contract Address หรือ RPC URL ไม่เจอ! เช็คไฟล์ .env หรือ server.js ด่วน");
-            }
-
-            // 2. เริ่มเชื่อมต่อ Blockchain
-            // 👈 [แก้ไข] เปลี่ยนจาก "http://127.0.0.1:8545" เป็น RPC_URL
             const provider = new ethers.JsonRpcProvider(RPC_URL); 
             const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
             
-            // 3. ดึงข้อมูลพนักงานจาก Database
             const response = await fetch('http://localhost:3000/api/employees');
-            if (!response.ok) throw new Error("API Server ไม่ตอบสนอง");
             const employees = await response.json();
             
             tbody.innerHTML = '';
+            let chainBroken = false;
             let alertTriggered = false;
 
-            // 4. วนลูปเช็คข้อมูลทีละคน
+            // 🔗 ตัวแปรสำหรับร้อยโซ่ (ต้องตรงกับ initialSync.js)
+            let previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
+
             for (let emp of employees) {
-                const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}`;
+                // 🧪 คำนวณ Hash แบบ Chain: SHA256(Data + PreviousHash)
+                const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}${previousHash}`;
                 const msgBuffer = new TextEncoder().encode(dataString);
                 const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
                 const currentHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 
                 let statusHtml = '';
-                try {
-                    const [onChainHash] = await contract.getLog(`EMP_DB_${emp.id}`);
-                    if (onChainHash === currentHash) {
-                        statusHtml = '<span class="status-badge status-ok">✅ ปกติ</span>';
-                    } else {
-                        statusHtml = '<span class="status-badge status-warn">❌ ถูกแก้ไข!</span>';
-                        alertTriggered = true;
+                
+                if (chainBroken) {
+                    // ถ้าโซ่ขาดไปแล้วจากคนก่อนหน้า คนที่เหลือต้องเป็น Warning
+                    statusHtml = '<span class="status-badge status-broken">⚠️ Chain Broken</span>';
+                } else {
+                    try {
+                        const [onChainHash] = await contract.getLog(`EMP_DB_${emp.id}`);
+                        
+                        if (onChainHash === currentHash) {
+                            statusHtml = '<span class="status-badge status-ok">✅ ปกติ</span>';
+                            previousHash = currentHash; // 🔗 ไปต่อ! ส่ง Hash นี้ให้คนถัดไป
+                        } else {
+                            statusHtml = '<span class="status-badge status-warn">❌ ถูกแก้ไข!</span>';
+                            chainBroken = true; // 🚨 หยุดส่งต่อ! โซ่ขาดที่จุดนี้
+                            alertTriggered = true;
+                        }
+                    } catch (e) {
+                        statusHtml = '<span class="status-badge">⚠️ ยังไม่เข้าระบบ</span>';
+                        chainBroken = true; 
                     }
-                } catch (e) {
-                    statusHtml = '<span class="status-badge">⚠️ ยังไม่เข้าระบบ</span>';
                 }
 
-                // แปะข้อมูลลงตาราง
                 tbody.innerHTML += `
                     <tr>
                         <td>${emp.id}</td>
                         <td>${emp.name}</td>
-                        <td>${emp.position}</td>
                         <td>${Number(emp.salary).toLocaleString()} ฿</td>
+                        <td><span class="chain-link">${currentHash.substring(0, 15)}...</span></td>
                         <td>${statusHtml}</td>
                     </tr>
                 `;
             }
 
-            // 5. แจ้งเตือนและอัปเดตเวลาล่าสุด
             if (alertTriggered) {
-                alert("🚨 ตรวจพบการบุกรุก! ข้อมูลบางส่วนถูกแก้ไข!");
+                console.error("🚨 SECURITY ALERT: Data Integrity Compromised!");
             }
             
-            const header = document.querySelector('.header h1');
-            header.innerHTML = `📊 Employee Audit Dashboard <br><small style="font-size:0.4em; color:gray;">ตรวจสอบล่าสุดเมื่อ: ${new Date().toLocaleTimeString()}</small>`;
+            document.getElementById('lastUpdate').innerText = `ตรวจสอบล่าสุดเมื่อ: ${new Date().toLocaleTimeString()}`;
 
         } catch (error) {
-            console.error("เกิดข้อผิดพลาด:", error);
-            tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:red;">❌ ไม่สามารถเชื่อมต่อระบบได้: ${error.message}</td></tr>`;
+            console.error("Audit Error:", error);
+            tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:red;">❌ เชื่อมต่อล้มเหลว: ${error.message}</td></tr>`;
         }
     }
 
-    // สั่งรันครั้งแรกทันทีที่เปิดหน้าเว็บ
     auditAll();
-    
-    // ตั้งเวลาให้รันตรวจสอบซ้ำอัตโนมัติทุก 10 วินาที
     setInterval(auditAll, 10000); 
 </script>
 </body>
