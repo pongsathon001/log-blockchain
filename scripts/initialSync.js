@@ -33,10 +33,16 @@ async function main() {
         const logId = `EMP_DB_${emp.id}`;
 
         try {
-            // เช็คก่อนว่ามีในระบบหรือยัง
-            await LogStorage.getLog(logId);
+            // เช็คก่อนว่ามีในระบบหรือยัง โดยดึงค่า Hash มาดู
+            const [onChainHash] = await LogStorage.getLog(logId);
+            
+            // 💡 ถ้าค่าที่ดึงมาว่างเปล่า (Empty String) แปลว่ายังไม่เคยบันทึก
+            if (!onChainHash || onChainHash === "") {
+                idsToStore.push(logId);
+                hashesToStore.push(currentHash);
+            }
         } catch (error) {
-            // ถ้ายังไม่มี ให้ใส่ใน List เตรียมบันทึก
+            // เผื่อไว้กรณี Blockchain โยน Error กลับมา ก็ให้ถือว่ายังไม่มีข้อมูลเช่นกัน
             idsToStore.push(logId);
             hashesToStore.push(currentHash);
         }
@@ -45,7 +51,7 @@ async function main() {
     if (idsToStore.length > 0) {
         console.log(`🚀 กำลังส่ง ${idsToStore.length} รายการขึ้น Blockchain...`);
         const tx = await LogStorage.batchStoreLogs(idsToStore, hashesToStore); // เรียกใช้ฟังก์ชัน Batch
-        await tx.wait();
+        await tx.wait(); // รอจนกว่านักขุดจะยืนยันข้อมูล
         console.log(`✅ บันทึกข้อมูลพนักงานทั้งหมดสำเร็จ!`);
     } else {
         console.log("ℹ️ ข้อมูลทั้งหมดอยู่ใน Blockchain เรียบร้อยแล้ว");

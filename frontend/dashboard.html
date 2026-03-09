@@ -42,7 +42,6 @@
 </div>
 
 <script>
-    // สังเกตว่าเราเอา CONTRACT_ADDRESS ออกไปแล้ว!
     const ABI = ["function getLog(string memory _logId) public view returns (string memory, uint256, address)"];
 
     async function auditAll() {
@@ -50,18 +49,20 @@
         const tbody = document.querySelector('#employeeTable tbody');
         
         try {
-            // 1. ไปถามหา Contract Address จาก API ของ Server (ดึงจาก .env)
+            // 1. ไปถามหา Contract Address และ RPC URL จาก API ของ Server
             const configResponse = await fetch('http://localhost:3000/api/config');
             if (!configResponse.ok) throw new Error("ไม่สามารถดึงค่า Config จาก Server ได้");
             const config = await configResponse.json();
             const CONTRACT_ADDRESS = config.contractAddress;
+            const RPC_URL = config.rpcUrl; // 👈 [แก้ไข] รับค่า rpcUrl จาก API
 
-            if (!CONTRACT_ADDRESS) {
-                throw new Error("หา Contract Address ไม่เจอ! เช็คไฟล์ .env ด่วน");
+            if (!CONTRACT_ADDRESS || !RPC_URL) {
+                throw new Error("หา Contract Address หรือ RPC URL ไม่เจอ! เช็คไฟล์ .env หรือ server.js ด่วน");
             }
 
             // 2. เริ่มเชื่อมต่อ Blockchain
-            const provider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
+            // 👈 [แก้ไข] เปลี่ยนจาก "http://127.0.0.1:8545" เป็น RPC_URL
+            const provider = new ethers.JsonRpcProvider(RPC_URL); 
             const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
             
             // 3. ดึงข้อมูลพนักงานจาก Database

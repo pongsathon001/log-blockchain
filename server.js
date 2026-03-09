@@ -6,9 +6,12 @@ const app = express();
 
 app.use(cors());
 
-// 👇 [ส่วนที่เพิ่มใหม่] สร้าง API ให้หน้าเว็บมาดึง Contract Address จาก .env
+// เปลี่ยนโค้ดส่วนนี้ใน server.js
 app.get('/api/config', (req, res) => {
-    res.json({ contractAddress: process.env.CONTRACT_ADDRESS });
+    res.json({ 
+        contractAddress: process.env.CONTRACT_ADDRESS,
+        rpcUrl: process.env.SEPOLIA_RPC_URL // 👈 เพิ่มบรรทัดนี้ เพื่อส่งลิงก์ Sepolia ให้หน้าเว็บ
+    });
 });
 
 app.get('/api/employees', async (req, res) => {
