@@ -15,7 +15,7 @@
         .status-badge { padding: 5px 12px; border-radius: 20px; font-size: 0.85em; font-weight: bold; display: inline-block; }
         .status-ok { background: #d4edda; color: #155724; }
         .status-warn { background: #f8d7da; color: #721c24; animation: blink 0.8s infinite; }
-        .status-broken { background: #fff3cd; color: #856404; } /* สถานะโซ่ขาด */
+        .status-broken { background: #fff3cd; color: #856404; }
         @keyframes blink { 50% { opacity: 0.5; } }
         .chain-link { color: #007bff; font-family: monospace; font-size: 0.8em; }
     </style>
@@ -57,6 +57,10 @@
             const configResponse = await fetch('http://localhost:3000/api/config');
             const config = await configResponse.json();
             const { contractAddress: CONTRACT_ADDRESS, rpcUrl: RPC_URL } = config;
+            
+            // 📡 ติดเรดาร์เช็คว่า Server ส่ง Config อะไรมาให้หน้าเว็บ!
+            console.log("🔗 เป้าหมาย RPC URL:", RPC_URL);
+            console.log("📝 เป้าหมาย Contract:", CONTRACT_ADDRESS);
 
             const provider = new ethers.JsonRpcProvider(RPC_URL); 
             const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
@@ -68,11 +72,9 @@
             let chainBroken = false;
             let alertTriggered = false;
 
-            // 🔗 ตัวแปรสำหรับร้อยโซ่ (ต้องตรงกับ initialSync.js)
             let previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
 
             for (let emp of employees) {
-                // 🧪 คำนวณ Hash แบบ Chain: SHA256(Data + PreviousHash)
                 const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}${previousHash}`;
                 const msgBuffer = new TextEncoder().encode(dataString);
                 const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
@@ -81,7 +83,6 @@
                 let statusHtml = '';
                 
                 if (chainBroken) {
-                    // ถ้าโซ่ขาดไปแล้วจากคนก่อนหน้า คนที่เหลือต้องเป็น Warning
                     statusHtml = '<span class="status-badge status-broken">⚠️ Chain Broken</span>';
                 } else {
                     try {
@@ -89,13 +90,15 @@
                         
                         if (onChainHash === currentHash) {
                             statusHtml = '<span class="status-badge status-ok">✅ ปกติ</span>';
-                            previousHash = currentHash; // 🔗 ไปต่อ! ส่ง Hash นี้ให้คนถัดไป
+                            previousHash = currentHash; 
                         } else {
                             statusHtml = '<span class="status-badge status-warn">❌ ถูกแก้ไข!</span>';
-                            chainBroken = true; // 🚨 หยุดส่งต่อ! โซ่ขาดที่จุดนี้
+                            chainBroken = true; 
                             alertTriggered = true;
                         }
                     } catch (e) {
+                        // 🚨 ติดเรดาร์จับผู้ร้ายตอนขอข้อมูลจาก Blockchain พลาด!
+                        console.error(`❌ ดึงข้อมูล EMP_DB_${emp.id} จากเชนล้มเหลว! สาเหตุ:`, e);
                         statusHtml = '<span class="status-badge">⚠️ ยังไม่เข้าระบบ</span>';
                         chainBroken = true; 
                     }
