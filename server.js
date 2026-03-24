@@ -114,62 +114,71 @@ async function accumulateAndStore() {
     }
 }
 
-// 3. ระบบ Audit: re-hash จาก general_log สดแล้วเทียบกับ Blockchain (blockchain = source of truth)
+// 3. ระบบ Audit: re-hash จากสถานะปัจจุบันของ general_log → เทียบกับ blockchain
 async function runAudit() {
     if (isAuditing) return;
     try {
         isAuditing = true;
-        // ตรวจทุก block
         const [blocks] = await pool.execute("SELECT * FROM audit_ledger ORDER BY block_id ASC");
 
         for (let block of blocks) {
             try {
-                // --- ขั้นตอนที่ 1: ดึง log สดจาก general_log ตามช่วงเวลาของ block ---
-                const [freshLogs] = await pool.execute(
-                    `SELECT event_time, user_host, argument FROM mysql.general_log 
-                     WHERE event_time BETWEEN ? AND ? 
-                       AND argument NOT LIKE '%general_log%' 
-                       AND argument NOT LIKE '%audit_ledger%' 
-                       AND argument NOT LIKE '%performance_schema%'
-                       AND argument NOT LIKE '%innodb%'
-                     ORDER BY event_time ASC`, [block.sequence_start_time, block.sequence_end_time]
-                );
+                // ขั้นตอนที่ 1: ดึง log เดิมจาก raw_logs_content แล้วเช็คทีละตัวใน general_log
+                const storedLogs = JSON.parse(block.raw_logs_content);
 
-                // --- ขั้นตอนที่ 2: ตรวจจำนวน log ---
-                if (freshLogs.length !== 20) {
-                    await pool.execute(
-                        `UPDATE audit_ledger 
-                         SET is_alert = 1, tamper_first_detected_at = COALESCE(tamper_first_detected_at, NOW()) 
-                         WHERE block_id = ?`,
-                        [block.block_id]
-                    );
-                    console.log(`❌ 🚨 Block #${block.block_id} จำนวน Log ไม่ตรง! (${freshLogs.length}/20)`);
-                    continue;
-                }
-
-                // --- ขั้นตอนที่ 3: re-hash ด้วย index + seed จาก block ก่อนหน้า ---
+                // ขั้นตอนที่ 2: ดึง seed จาก block ก่อนหน้า
                 const [prev] = await pool.execute(
                     "SELECT master_hash FROM audit_ledger WHERE block_id < ? ORDER BY block_id DESC LIMIT 1",
                     [block.block_id]
                 );
-                let reCalculatedHash = prev.length > 0
+                let currentHash = prev.length > 0
                     ? prev[0].master_hash
                     : "0000000000000000000000000000000000000000000000000000000000000000";
 
-                freshLogs.forEach((log, idx) => {
-                    const dataString = `${idx}${log.event_time}${log.user_host}${log.argument}${reCalculatedHash}`;
-                    reCalculatedHash = crypto.createHash('sha256').update(dataString).digest('hex');
-                });
+                // ขั้นตอนที่ 3: re-hash ทีละ log โดยเช็คจาก general_log จริง
+                for (let idx = 0; idx < storedLogs.length; idx++) {
+                    const log = storedLogs[idx];
 
-                // อัปเดต audit_ledger ให้สะท้อน general_log ปัจจุบัน (blockchain ยังเป็น source of truth)
+                    // เช็ค 1: log เดิมยังอยู่ครบ? (event_time + user_host + argument ตรงหมด)
+                    const [exact] = await pool.execute(
+                        `SELECT event_time, user_host, argument FROM mysql.general_log 
+                         WHERE event_time = ? AND user_host = ? AND argument = ? LIMIT 1`,
+                        [log.event_time, log.user_host, log.argument]
+                    );
+
+                    let data;
+                    if (exact.length > 0) {
+                        // log ไม่เปลี่ยน → hash ด้วยข้อมูลเดิม
+                        data = `${idx}${exact[0].event_time}${exact[0].user_host}${exact[0].argument}${currentHash}`;
+                    } else {
+                        // เช็ค 2: log ถูกแก้ไข? (event_time + user_host ตรง แต่ argument เปลี่ยน)
+                        const [modified] = await pool.execute(
+                            `SELECT event_time, user_host, argument FROM mysql.general_log 
+                             WHERE event_time = ? AND user_host = ? LIMIT 1`,
+                            [log.event_time, log.user_host]
+                        );
+
+                        if (modified.length > 0) {
+                            // log ถูกแก้ไข → hash ด้วยข้อมูลที่ถูกแก้ (hash เปลี่ยนเพราะ argument ต่าง)
+                            data = `${idx}${modified[0].event_time}${modified[0].user_host}${modified[0].argument}${currentHash}`;
+                        } else {
+                            // log ถูกลบ → hash ด้วย "DELETED"
+                            data = `${idx}DELETED${currentHash}`;
+                        }
+                    }
+
+                    currentHash = crypto.createHash('sha256').update(data).digest('hex');
+                }
+
+                // ขั้นตอนที่ 4: อัปเดต master_hash ให้สะท้อนสถานะ general_log ปัจจุบัน
                 await pool.execute(
-                    "UPDATE audit_ledger SET master_hash = ?, raw_logs_content = ? WHERE block_id = ?",
-                    [reCalculatedHash, JSON.stringify(freshLogs), block.block_id]
+                    "UPDATE audit_ledger SET master_hash = ? WHERE block_id = ?",
+                    [currentHash, block.block_id]
                 );
 
-                // --- ขั้นตอนที่ 4: เทียบกับ Blockchain ---
+                // ขั้นตอนที่ 5: เทียบกับ blockchain (ตัวตัดสินตัวเดียว)
                 const onChain = await contract.getLog(`BLOCK_${block.block_id}`);
-                const isAlert = reCalculatedHash !== onChain[0];
+                const isAlert = currentHash !== onChain[0];
 
                 if (isAlert) {
                     await pool.execute(
@@ -178,9 +187,7 @@ async function runAudit() {
                          WHERE block_id = ?`,
                         [block.block_id]
                     );
-                    console.log(`❌ 🚨 SECURITY ALERT: Block #${block.block_id} เนื้อหาถูกดัดแปลง!`);
-                    console.log(`   Recomputed: ${reCalculatedHash}`);
-                    console.log(`   Blockchain: ${onChain[0]}`);
+                    console.log(`❌ 🚨 SECURITY ALERT: Block #${block.block_id} — master_hash ไม่ตรงกับ Blockchain!`);
                 } else {
                     await pool.execute("UPDATE audit_ledger SET is_alert = 0 WHERE block_id = ?", [block.block_id]);
                 }
