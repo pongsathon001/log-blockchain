@@ -2,133 +2,111 @@
 <html lang="th">
 <head>
     <meta charset="UTF-8">
-    <title>Employee Hash Chain Auditor</title>
+    <title>Log Integrity Auditor (Block Model)</title>
     <link rel="icon" href="data:,">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
-    <style>
-        body { font-family: 'Inter', sans-serif; background: #f0f2f5; padding: 40px; }
-        .container { max-width: 1100px; margin: auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-        table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
-        th, td { padding: 15px; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: #1a2a6c; color: white; }
-        .status-badge { padding: 5px 12px; border-radius: 20px; font-size: 0.85em; font-weight: bold; display: inline-block; }
-        .status-ok { background: #d4edda; color: #155724; }
-        .status-warn { background: #f8d7da; color: #721c24; animation: blink 0.8s infinite; }
-        .status-broken { background: #fff3cd; color: #856404; }
-        @keyframes blink { 50% { opacity: 0.5; } }
-        .chain-link { color: #007bff; font-family: monospace; font-size: 0.8em; }
-    </style>
+    <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body>
+<body class="bg-slate-900 text-slate-100 p-6 md:p-12 font-sans">
 
-<div class="container">
-    <div class="header">
+<div class="max-w-6xl mx-auto">
+    <div class="flex flex-col md:flex-row justify-between items-center mb-10 gap-4">
         <div>
-            <h1>🔗 Employee Hash Chain Auditor</h1>
-            <p id="lastUpdate" style="color: gray; margin: 0;"></p>
+            <h1 class="text-3xl font-bold text-blue-400">🛡️ Log Integrity Auditor</h1>
+            <p class="text-slate-400 mt-2 text-sm" id="lastUpdate">กำลังเชื่อมต่อกับเซิร์ฟเวอร์...</p>
         </div>
-        <button onclick="auditAll()" style="padding: 12px 25px; cursor: pointer; background: #1a2a6c; color: white; border: none; border-radius: 5px;">🔍 Run Chain Audit</button>
+        <div class="bg-slate-800 px-5 py-2 rounded-full border border-slate-700 flex items-center gap-3 text-sm shadow-lg">
+            <span class="w-3 h-3 bg-green-500 rounded-full animate-ping absolute"></span>
+            <span class="w-3 h-3 bg-green-500 rounded-full relative"></span>
+            <span class="font-semibold tracking-wide">Live Monitoring (20 Logs/Block)</span>
+        </div>
     </div>
 
-    <table id="employeeTable">
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>ชื่อ-นามสกุล</th>
-                <th>เงินเดือน (MySQL)</th>
-                <th>Hash (Current)</th>
-                <th>สถานะ Integrity</th>
-            </tr>
-        </thead>
-        <tbody>
-            <tr><td colspan="5" style="text-align:center;">กำลังโหลดข้อมูล...</td></tr>
-        </tbody>
-    </table>
+    <div class="overflow-x-auto bg-slate-800/50 rounded-2xl border border-slate-700 shadow-2xl backdrop-blur-sm">
+        <table class="w-full text-left border-collapse">
+            <thead>
+                <tr class="bg-slate-800 text-slate-300 uppercase text-xs tracking-wider border-b border-slate-700">
+                    <th class="p-5 font-semibold">Block ID</th>
+                    <th class="p-5 font-semibold">ช่วงเวลาที่เก็บ Log (20 รายการ)</th>
+                    <th class="p-5 font-semibold">Master Hash (Blockchain)</th>
+                    <th class="p-5 font-semibold text-center">สถานะ Integrity</th>
+                </tr>
+            </thead>
+            <tbody id="auditBody">
+                <tr><td colspan="4" class="p-10 text-center text-slate-400 animate-pulse">⏳ กำลังสแกนข้อมูลจาก Blockchain...</td></tr>
+            </tbody>
+        </table>
+    </div>
 </div>
 
 <script>
-    const ABI = ["function getLog(string memory _logId) public view returns (string memory, uint256, address, uint256)"];
-
-    async function auditAll() {
-        const tbody = document.querySelector('#employeeTable tbody');
-        
+    async function fetchStatus() {
         try {
-            const configResponse = await fetch('http://localhost:3000/api/config');
-            const config = await configResponse.json();
-            const { contractAddress: CONTRACT_ADDRESS, rpcUrl: RPC_URL } = config;
+            // ดึงข้อมูล Block ล่าสุดจาก Server ที่เพิ่งทำเสร็จ
+            const res = await fetch('http://localhost:3000/api/get-status');
+            const blocks = await res.json();
             
-            // 📡 ติดเรดาร์เช็คว่า Server ส่ง Config อะไรมาให้หน้าเว็บ!
-            console.log("🔗 เป้าหมาย RPC URL:", RPC_URL);
-            console.log("📝 เป้าหมาย Contract:", CONTRACT_ADDRESS);
+            const tbody = document.getElementById('auditBody');
+            tbody.innerHTML = ''; // ล้างข้อมูลเก่าก่อนอัปเดตใหม่
 
-            const provider = new ethers.JsonRpcProvider(RPC_URL); 
-            const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
-            
-            const response = await fetch('http://localhost:3000/api/employees');
-            const employees = await response.json();
-            
-            tbody.innerHTML = '';
-            let chainBroken = false;
-            let alertTriggered = false;
+            if (blocks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="p-10 text-center text-slate-500">ยังไม่มี Block ข้อมูลในระบบ</td></tr>';
+                return;
+            }
 
-            let previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
-
-            for (let emp of employees) {
-                const dataString = `${emp.id}${emp.name}${emp.position}${emp.salary}${previousHash}`;
-                const msgBuffer = new TextEncoder().encode(dataString);
-                const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-                const currentHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-                let statusHtml = '';
+            // วนลูปวาดตารางทีละ Block
+            blocks.forEach(b => {
+                const tr = document.createElement('tr');
                 
-                if (chainBroken) {
-                    statusHtml = '<span class="status-badge status-broken">⚠️ Chain Broken</span>';
-                } else {
-                    try {
-                        const [onChainHash] = await contract.getLog(`EMP_DB_${emp.id}`);
-                        
-                        if (onChainHash === currentHash) {
-                            statusHtml = '<span class="status-badge status-ok">✅ ปกติ</span>';
-                            previousHash = currentHash; 
-                        } else {
-                            statusHtml = '<span class="status-badge status-warn">❌ ถูกแก้ไข!</span>';
-                            chainBroken = true; 
-                            alertTriggered = true;
-                        }
-                    } catch (e) {
-                        // 🚨 ติดเรดาร์จับผู้ร้ายตอนขอข้อมูลจาก Blockchain พลาด!
-                        console.error(`❌ ดึงข้อมูล EMP_DB_${emp.id} จากเชนล้มเหลว! สาเหตุ:`, e);
-                        statusHtml = '<span class="status-badge">⚠️ ยังไม่เข้าระบบ</span>';
-                        chainBroken = true; 
-                    }
-                }
-
-                tbody.innerHTML += `
-                    <tr>
-                        <td>${emp.id}</td>
-                        <td>${emp.name}</td>
-                        <td>${Number(emp.salary).toLocaleString()} ฿</td>
-                        <td><span class="chain-link">${currentHash.substring(0, 15)}...</span></td>
-                        <td>${statusHtml}</td>
-                    </tr>
+                // ถ้าโดนแฮก ให้พื้นหลังแดง ถ้าปกติพื้นหลังสลับสีนิดหน่อย
+                tr.className = `border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors ${
+                    b.is_alert ? 'bg-red-900/20' : ''
+                }`;
+                
+                // วาดคอลัมน์ต่างๆ
+                tr.innerHTML = `
+                    <td class="p-5 font-bold ${b.is_alert ? 'text-red-400' : 'text-blue-400'}">
+                        📦 #${b.block_id}
+                    </td>
+                    <td class="p-5 text-sm text-slate-300">
+                        <div class="flex flex-col">
+                            <span>🟢 ${b.sequence_start_time}</span>
+                            <span class="text-slate-500 text-xs">ถึง</span>
+                            <span>🔴 ${b.sequence_end_time}</span>
+                        </div>
+                    </td>
+                    <td class="p-5 font-mono text-xs opacity-70">
+                        ${b.master_hash}
+                    </td>
+                    <td class="p-5 text-center">
+                        <span class="px-4 py-1.5 rounded-full text-xs font-bold shadow-lg flex items-center justify-center gap-2 max-w-max mx-auto ${
+                            b.is_alert 
+                            ? 'bg-red-500/10 text-red-500 border border-red-500/50 animate-pulse' 
+                            : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                        }">
+                            ${b.is_alert ? '🚨 โดนดัดแปลง! (TAMPERED)' : '✅ ปลอดภัย (SECURE)'}
+                        </span>
+                    </td>
                 `;
-            }
+                tbody.appendChild(tr);
+            });
 
-            if (alertTriggered) {
-                console.error("🚨 SECURITY ALERT: Data Integrity Compromised!");
-            }
-            
-            document.getElementById('lastUpdate').innerText = `ตรวจสอบล่าสุดเมื่อ: ${new Date().toLocaleTimeString()}`;
+            document.getElementById('lastUpdate').innerText = `อัปเดตล่าสุด: ${new Date().toLocaleTimeString()} (รีเฟรชทุก 5 วินาที)`;
 
-        } catch (error) {
-            console.error("Audit Error:", error);
-            tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:red;">❌ เชื่อมต่อล้มเหลว: ${error.message}</td></tr>`;
+        } catch (e) {
+            console.error("เชื่อมต่อ Server ไม่สำเร็จ:", e);
+            document.getElementById('auditBody').innerHTML = `
+                <tr><td colspan="4" class="p-10 text-center text-red-400">
+                    ❌ ไม่สามารถเชื่อมต่อกับ Server ได้ กรุณาตรวจสอบว่าเปิด node server.js แล้วหรือยัง
+                </td></tr>
+            `;
         }
     }
 
-    auditAll();
-    setInterval(auditAll, 10000); 
+    // เรียกครั้งแรกทันที
+    fetchStatus(); 
+    // สั่งให้รีเฟรชอัปเดตข้อมูลอัตโนมัติทุกๆ 5 วินาที
+    setInterval(fetchStatus, 5000); 
 </script>
+
 </body>
 </html>

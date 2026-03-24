@@ -1,159 +1,146 @@
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const { ethers } = require('ethers');
 const crypto = require('crypto');
-require('dotenv').config();
+const cors = require('cors');
 
 const app = express();
 app.use(express.json());
-app.use(require('cors')());
+app.use(cors());
 
-// ตั้งค่า Blockchain Connection
+// ตั้งค่า Database
+const dbConfig = {
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+    dateStrings: true 
+};
+
+// ตั้งค่า Blockchain
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-
+const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 const abi = [
-    "function storeChainLog(string memory _logId, string memory _newHash) public",
-    "function batchStoreChain(string[] memory _logIds, string[] memory _logHashes) public",
-    "function lastRootHash() public view returns (string memory)",
-    "function getLog(string memory _logId) public view returns (string memory, uint256, address, uint256)"
+    "function addLog(string memory _id, string memory _hash) public",
+    "function getLog(string memory _id) public view returns (string memory, uint256, address)"
 ];
-const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, signer);
+const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, wallet);
 
-async function getDB() {
-    return await mysql.createConnection({
-        host: process.env.DB_HOST,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASS,
-        database: process.env.DB_NAME
-    });
+let lastProcessedTime = '1970-01-01 00:00:00';
+let isProcessingLogs = false;
+let isAuditing = false;
+
+// 1. ดึงเวลาล่าสุดตอนเปิด Server
+async function initServer() {
+    const db = await mysql.createConnection(dbConfig);
+    const [rows] = await db.execute("SELECT sequence_end_time FROM audit_ledger ORDER BY block_id DESC LIMIT 1");
+    if (rows.length > 0) lastProcessedTime = rows[0].sequence_end_time;
+    console.log(`🕒 ระบบพร้อม! เริ่มเฝ้าระวัง Log ใหม่ต่อจากเวลา: ${lastProcessedTime}`);
+    await db.end();
 }
 
-// 1. Logic การ Update (ตรวจสอบ -> แก้ไข -> ร้อยโซ่ใหม่ทุกคน)
-app.post('/api/employees/update', async (req, res) => {
-    const { id, name, position, salary } = req.body;
-    const db = await getDB();
-    
+// 2. ฟังก์ชันมัดรวม 20 Logs และร้อยโซ่ Hash (Intra-block Hash Chaining)
+async function accumulateAndStore() {
+    if (isProcessingLogs) return; 
+    const db = await mysql.createConnection(dbConfig);
     try {
-        // [STEP A] ตรวจสอบ Integrity
-        const [rows] = await db.execute('SELECT * FROM employees WHERE id = ?', [id]);
-        if (rows.length === 0) return res.status(404).json({ error: "ไม่พบข้อมูล" });
-        
-        const emp = rows[0];
-        try {
-            const [onChainHash] = await contract.getLog(`EMP_DB_${id}`);
-            if (onChainHash !== emp.stored_hash) {
-                return res.status(403).json({ error: "❌ ตรวจพบการบุกรุก! ข้อมูลใน DB ไม่ตรงกับ Blockchain ห้ามแก้ไข" });
+        isProcessingLogs = true;
+        const [logs] = await db.execute(
+            `SELECT event_time, user_host, argument FROM mysql.general_log 
+             WHERE event_time > ? AND argument NOT LIKE '%general_log%' AND argument NOT LIKE '%audit_ledger%' 
+             ORDER BY event_time ASC LIMIT 20`, [lastProcessedTime]
+        );
+
+        if (logs.length === 20) {
+            console.log("\n📦 พบ Log ใหม่ครบ 20 รายการ กำลังร้อยโซ่ Hash ภายใน Block...");
+            
+            // 🌟 ลอจิกการร้อยโซ่ 20 รอบ
+            let currentHash = "0000000000000000000000000000000000000000000000000000000000000000"; 
+            for (let log of logs) {
+                const dataString = `${log.event_time}${log.user_host}${log.argument}${currentHash}`;
+                currentHash = crypto.createHash('sha256').update(dataString).digest('hex');
             }
-        } catch (e) {
-            // ปล่อยผ่านถ้ายังไม่เคยมีบนเชน
-        }
-
-        // [STEP B] บันทึกค่าใหม่ลง MySQL
-        await db.execute('UPDATE employees SET name=?, position=?, salary=? WHERE id=?', [name, position, salary, id]);
-
-        // [STEP C] ดึงข้อมูลทุกคนมาร้อยโซ่ใหม่ (Hash Chain)
-        const [allEmployees] = await db.execute('SELECT * FROM employees ORDER BY id ASC');
-        let idsToStore = [];
-        let hashesToStore = [];
-        let previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
-
-        for (const employee of allEmployees) {
-            const dataString = `${employee.id}${employee.name}${employee.position}${employee.salary}${previousHash}`;
-            const currentHash = crypto.createHash("sha256").update(dataString).digest("hex");
             
-            idsToStore.push(`EMP_DB_${employee.id}`);
-            hashesToStore.push(currentHash);
-            
-            await db.execute('UPDATE employees SET stored_hash = ? WHERE id = ?', [currentHash, employee.id]);
-            previousHash = currentHash;
+            const masterHash = currentHash; // ตัวที่ 20 กลายเป็น Master Hash
+            const rawContent = JSON.stringify(logs);
+
+            const [result] = await db.execute(
+                "INSERT INTO audit_ledger (sequence_start_time, sequence_end_time, log_count, raw_logs_content, master_hash) VALUES (?, ?, ?, ?, ?)",
+                [logs[0].event_time, logs[19].event_time, 20, rawContent, masterHash]
+            );
+
+            const blockId = `BLOCK_${result.insertId}`;
+            console.log(`🚀 กำลังส่ง ${blockId} ขึ้น Blockchain... (รอคอนเฟิร์ม)`);
+            const tx = await contract.addLog(blockId, masterHash);
+            await tx.wait(); 
+            console.log(`✅ ${blockId} บันทึกลง Blockchain สำเร็จ!`);
+            lastProcessedTime = logs[19].event_time; 
         }
+    } finally {
+        isProcessingLogs = false;
+        await db.end();
+    }
+}
 
-        // [STEP D] ส่งแบบมัดรวมขึ้น Blockchain
-        const tx = await contract.batchStoreChain(idsToStore, hashesToStore);
-        await tx.wait();
-
-        // [STEP E] เก็บประวัติ
-        const newRoot = await contract.lastRootHash();
-        await db.execute('INSERT INTO security_logs (action, employee_id, details, action_hash) VALUES (?, ?, ?, ?)', 
-            ['UPDATE', id, `Updated salary to ${salary}`, newRoot]);
-
-        res.json({ success: true, txHash: tx.hash, message: "✅ อัปเดตและร้อยโซ่ใหม่เรียบร้อย!" });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    } finally { await db.end(); }
-});
-
-// 2. Logic การลบ
-app.post('/api/employees/delete', async (req, res) => {
-    const { id } = req.body;
-    const db = await getDB();
-
+// 3. ฟังก์ชันตรวจสอบความถูกต้อง (Audit)
+async function runAudit() {
+    if (isAuditing) return;
+    const db = await mysql.createConnection(dbConfig);
     try {
-        const [rows] = await db.execute('SELECT stored_hash FROM employees WHERE id = ?', [id]);
-        if (rows.length > 0) {
+        isAuditing = true;
+        const [blocks] = await db.execute("SELECT * FROM audit_ledger ORDER BY block_id DESC LIMIT 10");
+        
+        for (let block of blocks) {
+            // 🌟 ร้อยโซ่ Hash ใหม่จากข้อมูลดิบ เพื่อเทียบกับของจริง
+            const parsedLogs = JSON.parse(block.raw_logs_content);
+            let checkHash = "0000000000000000000000000000000000000000000000000000000000000000";
+            
+            for (let log of parsedLogs) {
+                const dataString = `${log.event_time}${log.user_host}${log.argument}${checkHash}`;
+                checkHash = crypto.createHash('sha256').update(dataString).digest('hex');
+            }
+
             try {
-                const [onChainHash] = await contract.getLog(`EMP_DB_${id}`);
-                if (onChainHash !== rows[0].stored_hash) {
-                    return res.status(403).json({ error: "❌ ข้อมูลใน DB ถูกดัดแปลงอยู่! ห้ามลบ" });
-                }
-            } catch (e) {}
+                const onChain = await contract.getLog(`BLOCK_${block.block_id}`);
+                const isAlert = checkHash !== onChain[0];
+                await db.execute("UPDATE audit_ledger SET is_alert = ? WHERE block_id = ?", [isAlert, block.block_id]);
+            } catch (error) {
+                if (error.message.includes("Block not found")) console.log(`⏳ Block #${block.block_id} รอการยืนยันบนเชน...`);
+            }
         }
+    } finally {
+        isAuditing = false;
+        await db.end();
+    }
+}
 
-        await db.execute('DELETE FROM employees WHERE id = ?', [id]);
-
-        const [allEmployees] = await db.execute('SELECT * FROM employees ORDER BY id ASC');
-        let idsToStore = [];
-        let hashesToStore = [];
-        let previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
-
-        for (const employee of allEmployees) {
-            const dataString = `${employee.id}${employee.name}${employee.position}${employee.salary}${previousHash}`;
-            const currentHash = crypto.createHash("sha256").update(dataString).digest("hex");
-            
-            idsToStore.push(`EMP_DB_${employee.id}`);
-            hashesToStore.push(currentHash);
-            
-            await db.execute('UPDATE employees SET stored_hash = ? WHERE id = ?', [currentHash, employee.id]);
-            previousHash = currentHash;
-        }
-
-        let txHash = null;
-        if (idsToStore.length > 0) {
-            const tx = await contract.batchStoreChain(idsToStore, hashesToStore);
-            await tx.wait();
-            txHash = tx.hash;
-        } else {
-            const emptyHash = crypto.createHash("sha256").update("EMPTY_DB").digest("hex");
-            const tx = await contract.storeChainLog(`DB_CLEARED_${Date.now()}`, emptyHash);
-            await tx.wait();
-            txHash = tx.hash;
-        }
-
-        const newRoot = idsToStore.length > 0 ? await contract.lastRootHash() : "EMPTY_CHAIN";
-        await db.execute('INSERT INTO security_logs (action, employee_id, details, action_hash) VALUES (?, ?, ?, ?)', 
-            ['DELETE', id, `Deleted employee ${id}`, newRoot]);
-
-        res.json({ success: true, txHash: txHash, message: "✅ ลบและร้อยโซ่ใหม่เรียบร้อย!" });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    } finally { await db.end(); }
+// 4. API ส่งข้อมูลให้หน้า Dashboard
+app.get('/api/get-status', async (req, res) => {
+    const db = await mysql.createConnection(dbConfig);
+    try {
+        const [rows] = await db.execute("SELECT * FROM audit_ledger ORDER BY block_id DESC LIMIT 20");
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        await db.end();
+    }
 });
 
-// 3. API ดึงข้อมูลพนักงาน (ใช้โชว์ตาราง)
-app.get('/api/employees', async (req, res) => {
-    const db = await getDB();
-    const [rows] = await db.execute('SELECT * FROM employees ORDER BY id ASC');
-    await db.end();
-    res.json(rows);
-});
-
-// 4. 🔥 API ดึง Config ที่หายไป!
+// 5. API ส่ง Config
 app.get('/api/config', (req, res) => {
-    res.json({
-        contractAddress: process.env.CONTRACT_ADDRESS,
-        rpcUrl: process.env.RPC_URL
-    });
+    res.json({ contractAddress: process.env.CONTRACT_ADDRESS, rpcUrl: process.env.RPC_URL });
 });
 
-app.listen(3000, () => console.log("🚀 Server running on port 3000 (Original Chain Mode)"));
+// เริ่มทำงาน
+initServer().then(() => {
+    setInterval(accumulateAndStore, 10000); 
+    setInterval(runAudit, 20000); 
+});
+
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`🛡️ Server Running (Port ${PORT}) 🛡️`);
+    console.log(`Mode: Block Aggregation (20 logs) + Intra-block Hash Chaining`);
+});
