@@ -117,6 +117,7 @@
                             }">
                                 ${b.is_alert ? '🚨 โดนดัดแปลง! (TAMPERED)' : '✅ ปลอดภัย (SECURE)'}
                             </span>
+                            ${b.tamper_first_detected_at ? `<p class="text-xs text-red-400 mt-2">พบครั้งแรก: ${b.tamper_first_detected_at}</p>` : ''}
                         </td>
                     `;
                     tbody.appendChild(tr);

@@ -32,6 +32,8 @@ async function main() {
         FROM mysql.general_log 
         WHERE argument NOT LIKE '%general_log%' 
           AND argument NOT LIKE '%audit_ledger%'
+          AND argument NOT LIKE '%performance_schema%'
+          AND argument NOT LIKE '%innodb%'
         ORDER BY event_time ASC
     `);
     console.log(`📦 พบ Log ทั้งหมด ${rows.length} รายการ กำลังเริ่มการมัดรวมกลุ่มละ 20...`);
@@ -46,12 +48,12 @@ async function main() {
             const blockNum = (i / 20) + 1;
             console.log(`\n⛓️ กำลังประมวลผล Block #${blockNum} (Logs ${i + 1} - ${i + 20}) และร้อยโซ่ Hash...`);
 
-            // ลอจิกการร้อยโซ่ Hash โดยใช้ master_hash ของ block ก่อนหน้าเป็น seed
+            // ลอจิกการร้อยโซ่ Hash โดยใช้ master_hash ของ block ก่อนหน้าเป็น seed + row index
             let currentHash = prevMasterHash;
-            for (let log of chunk) {
-                const dataString = `${log.event_time}${log.user_host}${log.argument}${currentHash}`;
+            chunk.forEach((log, idx) => {
+                const dataString = `${idx}${log.event_time}${log.user_host}${log.argument}${currentHash}`;
                 currentHash = crypto.createHash("sha256").update(dataString).digest("hex");
-            }
+            });
 
             const masterHash = currentHash; 
             const rawContent = JSON.stringify(chunk);
