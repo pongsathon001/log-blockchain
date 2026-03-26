@@ -40,28 +40,76 @@ const abi = [
 ];
 const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, wallet);
 
+// ===== State =====
 let lastProcessedTime = '1970-01-01 00:00:00';
-let isProcessingLogs = false;
+let currentGroupNumber = 1;
+let currentRowIndex = 0;      // 0 = ยังไม่มีแถวในกลุ่มนี้, 1-20 = แถวล่าสุดที่ใส่
+let previousHash = '0000000000000000000000000000000000000000000000000000000000000000';
+let isProcessing = false;
 let isAuditing = false;
 
-// 1. ดึงเวลาล่าสุดตอนเปิด Server
+// ===== External Log Queue (สำหรับ /api/ingest) =====
+let externalQueue = [];
+
+// 1. เริ่มต้น Server: สร้างตาราง + ดึง state ล่าสุด
 async function initServer() {
     try {
-        const [rows] = await pool.execute("SELECT sequence_end_time FROM audit_ledger ORDER BY block_id DESC LIMIT 1");
-        if (rows.length > 0) lastProcessedTime = rows[0].sequence_end_time;
-        console.log(`🕒 ระบบพร้อม! เริ่มเฝ้าระวัง Log ใหม่ต่อจากเวลา: ${lastProcessedTime}`);
+        // สร้างตาราง audit_ledger แบบใหม่ (ถ้ายังไม่มี)
+        await pool.execute(`
+            CREATE TABLE IF NOT EXISTS audit_ledger (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                group_number INT NOT NULL,
+                row_index INT NOT NULL,
+                event_time DATETIME(6) NOT NULL,
+                log_source VARCHAR(100) NOT NULL,
+                log_content TEXT NOT NULL,
+                current_hash VARCHAR(64) NOT NULL,
+                is_anchor TINYINT DEFAULT 0,
+                tx_hash VARCHAR(100),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_alert TINYINT DEFAULT 0,
+                tamper_first_detected_at DATETIME,
+                INDEX idx_group (group_number),
+                INDEX idx_event_time (event_time)
+            )
+        `);
+
+        // ดึง state ล่าสุดจาก audit_ledger
+        const [lastRow] = await pool.execute(
+            "SELECT group_number, row_index, current_hash, event_time FROM audit_ledger ORDER BY id DESC LIMIT 1"
+        );
+
+        if (lastRow.length > 0) {
+            const last = lastRow[0];
+            previousHash = last.current_hash;
+            lastProcessedTime = last.event_time;
+
+            if (last.row_index >= 20) {
+                // กลุ่มเดิมครบ 20 แล้ว → เริ่มกลุ่มใหม่
+                currentGroupNumber = last.group_number + 1;
+                currentRowIndex = 0;
+            } else {
+                currentGroupNumber = last.group_number;
+                currentRowIndex = last.row_index;
+            }
+        }
+
+        console.log(`🕒 ระบบพร้อม! Group: ${currentGroupNumber}, Row: ${currentRowIndex}/20, เฝ้าระวัง Log ต่อจาก: ${lastProcessedTime}`);
     } catch (error) {
         console.error("❌ เชื่อมต่อฐานข้อมูลไม่ได้:", error.message);
         process.exit(1);
     }
 }
 
-// 2. ฟังก์ชันมัดรวม 20 Logs และร้อยโซ่ Hash 
-async function accumulateAndStore() {
-    if (isProcessingLogs) return;
+// 2. ดึง Log 1 ตัว → Hash Chain → INSERT → ครบ 20 ส่ง Blockchain
+async function processNextLog() {
+    if (isProcessing) return;
     try {
-        isProcessingLogs = true;
-        // ดึง Log ที่ยังไม่เคยประมวลผล (ใช้ Filter ให้ตรงกับ Audit)
+        isProcessing = true;
+
+        let logEntry = null;
+
+        // ลำดับความสำคัญ: general_log ก่อน → แล้วค่อย external queue
         const [logs] = await pool.execute(
             `SELECT event_time, user_host, argument FROM mysql.general_log 
              WHERE event_time > ? 
@@ -69,136 +117,193 @@ async function accumulateAndStore() {
                AND argument NOT LIKE '%audit_ledger%' 
                AND argument NOT LIKE '%performance_schema%'
                AND argument NOT LIKE '%innodb%'
-             ORDER BY event_time ASC LIMIT 20`, [lastProcessedTime]
+             ORDER BY event_time ASC LIMIT 1`, [lastProcessedTime]
         );
 
-        if (logs && logs.length === 20) {
-            console.log("\n📦 พบ Log ใหม่ครบ 20 รายการ กำลังร้อยโซ่ Hash ภายใน Block...");
+        if (logs.length > 0) {
+            logEntry = {
+                event_time: logs[0].event_time,
+                source: 'general_log',
+                content: `${logs[0].user_host} | ${logs[0].argument}`
+            };
+        } else if (externalQueue.length > 0) {
+            // ดึงจาก external queue
+            logEntry = externalQueue.shift();
+        }
 
-            const [prevBlock] = await pool.execute("SELECT master_hash FROM audit_ledger ORDER BY block_id DESC LIMIT 1");
-            let currentHash = prevBlock.length > 0 
-                ? prevBlock[0].master_hash 
-                : "0000000000000000000000000000000000000000000000000000000000000000";
+        if (!logEntry) return; // ไม่มี log ใหม่
 
-            logs.forEach((log, idx) => {
-                // รวม index ตำแหน่งของ log เพื่อป้องกันการสลับลำดับ
-                const dataString = `${idx}${log.event_time}${log.user_host}${log.argument}${currentHash}`;
-                currentHash = crypto.createHash('sha256').update(dataString).digest('hex');
-            });
+        // ===== Hash Chaining =====
+        currentRowIndex++;
+        const dataString = `${currentRowIndex}${logEntry.event_time}${logEntry.source}${logEntry.content}${previousHash}`;
+        const currentHash = crypto.createHash('sha256').update(dataString).digest('hex');
 
-            const masterHash = currentHash;
-            const rawContent = JSON.stringify(logs);
+        // INSERT 1 แถว
+        await pool.execute(
+            `INSERT INTO audit_ledger (group_number, row_index, event_time, log_source, log_content, current_hash) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [currentGroupNumber, currentRowIndex, logEntry.event_time, logEntry.source, logEntry.content, currentHash]
+        );
 
-            const [result] = await pool.execute(
-                "INSERT INTO audit_ledger (sequence_start_time, sequence_end_time, log_count, raw_logs_content, master_hash) VALUES (?, ?, ?, ?, ?)",
-                [logs[0].event_time, logs[19].event_time, 20, rawContent, masterHash]
-            );
+        console.log(`🔗 Group ${currentGroupNumber} | Row ${currentRowIndex}/20 | Hash: ${currentHash.substring(0, 16)}...`);
 
-            const blockId = `BLOCK_${result.insertId}`;
-            console.log(`🚀 กำลังส่ง ${blockId} ขึ้น Blockchain...`);
+        previousHash = currentHash;
+        lastProcessedTime = logEntry.event_time;
+
+        // ===== ครบ 20 → ส่ง Blockchain =====
+        if (currentRowIndex >= 20) {
+            const blockId = `GROUP_${currentGroupNumber}`;
+            console.log(`🚀 ครบ 20 แถว! กำลังส่ง ${blockId} ขึ้น Blockchain...`);
 
             try {
-                const tx = await contract.addLog(blockId, masterHash);
+                const tx = await contract.addLog(blockId, currentHash);
                 await tx.wait();
-                console.log(`✅ ${blockId} บันทึกลง Blockchain สำเร็จ!`);
-                lastProcessedTime = logs[19].event_time; 
+
+                // อัปเดตแถว anchor
+                await pool.execute(
+                    "UPDATE audit_ledger SET is_anchor = 1, tx_hash = ? WHERE group_number = ? AND row_index = 20",
+                    [tx.hash, currentGroupNumber]
+                );
+
+                console.log(`✅ ${blockId} บันทึกลง Blockchain สำเร็จ! TX: ${tx.hash}`);
+
+                // เริ่มกลุ่มใหม่
+                currentGroupNumber++;
+                currentRowIndex = 0;
+
             } catch (bcError) {
-                await pool.execute("DELETE FROM audit_ledger WHERE block_id = ?", [result.insertId]);
+                // Blockchain fail → ลบทั้งกลุ่ม แล้ว rollback state
                 console.error(`❌ Blockchain fail!`, bcError.message);
+                await pool.execute("DELETE FROM audit_ledger WHERE group_number = ?", [currentGroupNumber]);
+
+                // Rollback state กลับไป state ของ group ก่อนหน้า
+                const [prevRow] = await pool.execute(
+                    "SELECT group_number, row_index, current_hash, event_time FROM audit_ledger ORDER BY id DESC LIMIT 1"
+                );
+                if (prevRow.length > 0) {
+                    previousHash = prevRow[0].current_hash;
+                    lastProcessedTime = prevRow[0].event_time;
+                    currentGroupNumber = prevRow[0].group_number + 1;
+                    currentRowIndex = 0;
+                } else {
+                    previousHash = '0000000000000000000000000000000000000000000000000000000000000000';
+                    lastProcessedTime = '1970-01-01 00:00:00';
+                    currentGroupNumber = 1;
+                    currentRowIndex = 0;
+                }
             }
         }
+
     } catch (error) {
-        console.error("❌ accumulateAndStore Error:", error.message);
+        console.error("❌ processNextLog Error:", error.message);
     } finally {
-        isProcessingLogs = false;
+        isProcessing = false;
     }
 }
 
-// 3. ระบบ Audit: re-hash จากสถานะปัจจุบันของ general_log → เทียบกับ blockchain
+// 3. Audit: re-hash ทุกแถว → เทียบ anchor กับ blockchain
 async function runAudit() {
     if (isAuditing) return;
     try {
         isAuditing = true;
-        const [blocks] = await pool.execute("SELECT * FROM audit_ledger ORDER BY block_id ASC");
 
-        for (let block of blocks) {
+        // ดึงทุก group ที่มี anchor (ส่ง blockchain แล้ว)
+        const [anchors] = await pool.execute(
+            "SELECT DISTINCT group_number FROM audit_ledger WHERE is_anchor = 1 ORDER BY group_number ASC"
+        );
+
+        for (const anchor of anchors) {
             try {
-                // ขั้นตอนที่ 1: ดึง log เดิมจาก raw_logs_content แล้วเช็คทีละตัวใน general_log
-                const storedLogs = JSON.parse(block.raw_logs_content);
+                const groupNum = anchor.group_number;
 
-                // ขั้นตอนที่ 2: ดึง seed จาก block ก่อนหน้า
-                const [prev] = await pool.execute(
-                    "SELECT master_hash FROM audit_ledger WHERE block_id < ? ORDER BY block_id DESC LIMIT 1",
-                    [block.block_id]
+                // ดึงทุกแถวในกลุ่มนี้
+                const [rows] = await pool.execute(
+                    "SELECT * FROM audit_ledger WHERE group_number = ? ORDER BY row_index ASC",
+                    [groupNum]
                 );
-                let currentHash = prev.length > 0
-                    ? prev[0].master_hash
-                    : "0000000000000000000000000000000000000000000000000000000000000000";
 
-                // ขั้นตอนที่ 3: re-hash ทีละ log โดยเช็คจาก general_log จริง
-                for (let idx = 0; idx < storedLogs.length; idx++) {
-                    const log = storedLogs[idx];
+                if (rows.length === 0) continue;
 
-                    // เช็ค 1: log เดิมยังอยู่ครบ? (event_time + user_host + argument ตรงหมด)
-                    const [exact] = await pool.execute(
-                        `SELECT event_time, user_host, argument FROM mysql.general_log 
-                         WHERE event_time = ? AND user_host = ? AND argument = ? LIMIT 1`,
-                        [log.event_time, log.user_host, log.argument]
+                // ดึง hash ของแถวสุดท้ายของกลุ่มก่อนหน้า (seed)
+                let reHash;
+                if (groupNum === 1) {
+                    reHash = '0000000000000000000000000000000000000000000000000000000000000000';
+                } else {
+                    const [prevAnchor] = await pool.execute(
+                        "SELECT current_hash FROM audit_ledger WHERE group_number = ? AND row_index = 20 LIMIT 1",
+                        [groupNum - 1]
                     );
-
-                    let data;
-                    if (exact.length > 0) {
-                        // log ไม่เปลี่ยน → hash ด้วยข้อมูลเดิม
-                        data = `${idx}${exact[0].event_time}${exact[0].user_host}${exact[0].argument}${currentHash}`;
-                    } else {
-                        // เช็ค 2: log ถูกแก้ไข? (event_time + user_host ตรง แต่ argument เปลี่ยน)
-                        const [modified] = await pool.execute(
-                            `SELECT event_time, user_host, argument FROM mysql.general_log 
-                             WHERE event_time = ? AND user_host = ? LIMIT 1`,
-                            [log.event_time, log.user_host]
-                        );
-
-                        if (modified.length > 0) {
-                            // log ถูกแก้ไข → hash ด้วยข้อมูลที่ถูกแก้ (hash เปลี่ยนเพราะ argument ต่าง)
-                            data = `${idx}${modified[0].event_time}${modified[0].user_host}${modified[0].argument}${currentHash}`;
-                        } else {
-                            // log ถูกลบ → hash ด้วย "DELETED"
-                            data = `${idx}DELETED${currentHash}`;
-                        }
-                    }
-
-                    currentHash = crypto.createHash('sha256').update(data).digest('hex');
+                    reHash = prevAnchor.length > 0
+                        ? prevAnchor[0].current_hash
+                        : '0000000000000000000000000000000000000000000000000000000000000000';
                 }
 
-                // ขั้นตอนที่ 4: อัปเดต master_hash ให้สะท้อนสถานะ general_log ปัจจุบัน
-                await pool.execute(
-                    "UPDATE audit_ledger SET master_hash = ? WHERE block_id = ?",
-                    [currentHash, block.block_id]
-                );
+                // Re-hash ทุกแถว
+                for (const row of rows) {
+                    if (row.log_source === 'general_log') {
+                        // ตรวจจาก general_log จริง
+                        const parts = row.log_content.split(' | ');
+                        const userHost = parts[0] || '';
+                        const argument = parts.slice(1).join(' | ') || '';
 
-                // ขั้นตอนที่ 5: เทียบกับ blockchain (ตัวตัดสินตัวเดียว)
-                const onChain = await contract.getLog(`BLOCK_${block.block_id}`);
-                const isAlert = currentHash !== onChain[0];
+                        const [exact] = await pool.execute(
+                            `SELECT event_time, user_host, argument FROM mysql.general_log 
+                             WHERE event_time = ? AND user_host = ? AND argument = ? LIMIT 1`,
+                            [row.event_time, userHost, argument]
+                        );
+
+                        let content;
+                        if (exact.length > 0) {
+                            content = `${exact[0].user_host} | ${exact[0].argument}`;
+                        } else {
+                            // เช็คว่าถูกแก้ไขหรือถูกลบ
+                            const [modified] = await pool.execute(
+                                `SELECT event_time, user_host, argument FROM mysql.general_log 
+                                 WHERE event_time = ? AND user_host = ? LIMIT 1`,
+                                [row.event_time, userHost]
+                            );
+                            if (modified.length > 0) {
+                                content = `${modified[0].user_host} | ${modified[0].argument}`;
+                            } else {
+                                content = 'DELETED';
+                            }
+                        }
+
+                        const dataString = `${row.row_index}${row.event_time}${row.log_source}${content}${reHash}`;
+                        reHash = crypto.createHash('sha256').update(dataString).digest('hex');
+                    } else {
+                        // External log → ใช้ข้อมูลจาก audit_ledger ตรงๆ (ไม่มี source table ให้ re-query)
+                        const dataString = `${row.row_index}${row.event_time}${row.log_source}${row.log_content}${reHash}`;
+                        reHash = crypto.createHash('sha256').update(dataString).digest('hex');
+                    }
+                }
+
+                // เทียบ anchor hash กับ blockchain
+                const onChain = await contract.getLog(`GROUP_${groupNum}`);
+                const isAlert = reHash !== onChain[0];
 
                 if (isAlert) {
                     await pool.execute(
                         `UPDATE audit_ledger 
                          SET is_alert = 1, tamper_first_detected_at = COALESCE(tamper_first_detected_at, NOW()) 
-                         WHERE block_id = ?`,
-                        [block.block_id]
+                         WHERE group_number = ?`,
+                        [groupNum]
                     );
-                    console.log(`❌ 🚨 SECURITY ALERT: Block #${block.block_id} — master_hash ไม่ตรงกับ Blockchain!`);
+                    console.log(`🚨 ALERT: Group ${groupNum} — hash ไม่ตรงกับ Blockchain!`);
                 } else {
-                    await pool.execute("UPDATE audit_ledger SET is_alert = 0 WHERE block_id = ?", [block.block_id]);
+                    await pool.execute(
+                        "UPDATE audit_ledger SET is_alert = 0 WHERE group_number = ?",
+                        [groupNum]
+                    );
                 }
 
             } catch (error) {
                 if (error.message.includes("Block not found")) {
-                    console.log(`⏳ Block #${block.block_id} รอการยืนยันบนเชน...`);
+                    console.log(`⏳ Group ${anchor.group_number} รอการยืนยันบนเชน...`);
                 } else if (error.message.includes('timeout') || error.code === 'TIMEOUT') {
-                    console.log(`⚠️ Timeout Block #${block.block_id} จะลองใหม่รอบหน้า`);
+                    console.log(`⚠️ Timeout Group ${anchor.group_number} จะลองใหม่รอบหน้า`);
                 } else {
-                    console.error(`Audit Error (Block ${block.block_id}):`, error.message);
+                    console.error(`Audit Error (Group ${anchor.group_number}):`, error.message);
                 }
             }
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -208,7 +313,39 @@ async function runAudit() {
     }
 }
 
-// 4. API ส่งข้อมูลให้หน้า Dashboard
+// 4. API: รับ Log จากภายนอก
+app.post('/api/ingest', (req, res) => {
+    try {
+        const body = req.body;
+        let logs = [];
+
+        if (Array.isArray(body.logs)) {
+            logs = body.logs;
+        } else if (body.log_source && body.message) {
+            logs = [body];
+        } else {
+            return res.status(400).json({ error: 'ต้องระบุ log_source และ message' });
+        }
+
+        let count = 0;
+        for (const log of logs) {
+            if (!log.log_source || !log.message) continue;
+            externalQueue.push({
+                event_time: log.event_time || new Date().toISOString().slice(0, 19).replace('T', ' '),
+                source: `api:${log.log_source}`,
+                content: log.message
+            });
+            count++;
+        }
+
+        console.log(`📥 รับ ${count} log จาก API (Queue: ${externalQueue.length})`);
+        res.json({ success: true, received: count, queueSize: externalQueue.length });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 5. API: ดึงข้อมูลให้ Dashboard
 app.get('/api/get-status', async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
@@ -216,14 +353,27 @@ app.get('/api/get-status', async (req, res) => {
         const offset = (page - 1) * limit;
 
         const [rows] = await pool.execute(
-            "SELECT * FROM audit_ledger ORDER BY block_id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM audit_ledger ORDER BY id DESC LIMIT ? OFFSET ?",
             [String(limit), String(offset)]
         );
         const [countResult] = await pool.execute("SELECT COUNT(*) as total FROM audit_ledger");
         const total = countResult[0].total;
 
+        // ดึงสรุปตาม group
+        const [groups] = await pool.execute(
+            `SELECT group_number, COUNT(*) as row_count, 
+                    MAX(is_anchor) as has_anchor, MAX(is_alert) as has_alert
+             FROM audit_ledger GROUP BY group_number ORDER BY group_number DESC LIMIT 10`
+        );
+
         res.json({
-            blocks: rows,
+            rows,
+            groups,
+            state: {
+                currentGroup: currentGroupNumber,
+                currentRow: currentRowIndex,
+                queueSize: externalQueue.length
+            },
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
         });
     } catch (err) {
@@ -231,18 +381,90 @@ app.get('/api/get-status', async (req, res) => {
     }
 });
 
-// 5. API ส่ง Config
+// 6. API: Report — ดึงข้อมูล alert ทั้งหมด + เทียบกับ blockchain
+app.get('/api/report', async (req, res) => {
+    try {
+        // ดึงทุก group ที่มี anchor
+        const [groups] = await pool.execute(
+            `SELECT group_number, COUNT(*) as row_count,
+                    MIN(event_time) as start_time, MAX(event_time) as end_time,
+                    MAX(is_anchor) as has_anchor, MAX(is_alert) as has_alert
+             FROM audit_ledger GROUP BY group_number ORDER BY group_number ASC`
+        );
+
+        const report = [];
+        for (const g of groups) {
+            // ดึง anchor row (แถวที่ 20) ของกลุ่มนี้
+            const [anchorRow] = await pool.execute(
+                "SELECT current_hash, tx_hash FROM audit_ledger WHERE group_number = ? AND is_anchor = 1 LIMIT 1",
+                [g.group_number]
+            );
+
+            let blockchainHash = null;
+            let blockchainTimestamp = null;
+            let blockchainRecorder = null;
+            let onChainStatus = 'NOT_ON_CHAIN';
+
+            if (anchorRow.length > 0) {
+                try {
+                    const onChain = await contract.getLog(`GROUP_${g.group_number}`);
+                    blockchainHash = onChain[0];
+                    blockchainTimestamp = new Date(Number(onChain[1]) * 1000).toISOString().slice(0, 19).replace('T', ' ');
+                    blockchainRecorder = onChain[2];
+                    onChainStatus = anchorRow[0].current_hash === blockchainHash ? 'MATCH' : 'MISMATCH';
+                } catch (e) {
+                    if (e.message.includes("Block not found")) {
+                        onChainStatus = 'PENDING';
+                    } else {
+                        onChainStatus = 'ERROR';
+                    }
+                }
+            }
+
+            // ถ้ามี alert ดึงรายละเอียดแถวที่มีปัญหา
+            let alertRows = [];
+            if (g.has_alert === 1) {
+                const [rows] = await pool.execute(
+                    "SELECT row_index, event_time, log_source, log_content, current_hash, tamper_first_detected_at FROM audit_ledger WHERE group_number = ? AND is_alert = 1 ORDER BY row_index ASC",
+                    [g.group_number]
+                );
+                alertRows = rows;
+            }
+
+            report.push({
+                group_number: g.group_number,
+                row_count: g.row_count,
+                start_time: g.start_time,
+                end_time: g.end_time,
+                has_anchor: g.has_anchor === 1,
+                audit_hash: anchorRow.length > 0 ? anchorRow[0].current_hash : null,
+                tx_hash: anchorRow.length > 0 ? anchorRow[0].tx_hash : null,
+                blockchain_hash: blockchainHash,
+                blockchain_timestamp: blockchainTimestamp,
+                blockchain_recorder: blockchainRecorder,
+                status: onChainStatus,
+                alert_rows: alertRows
+            });
+        }
+
+        res.json({ report, generatedAt: new Date().toISOString() });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 7. API: ดึง Config
 app.get('/api/config', (req, res) => {
     res.json({ contractAddress: process.env.CONTRACT_ADDRESS, rpcUrl: process.env.RPC_URL });
 });
 
-// 6. เริ่มการทำงาน
+// 8. เริ่มการทำงาน
 initServer().then(() => {
-    setInterval(accumulateAndStore, 10000); 
-    setInterval(runAudit, 30000); 
+    setInterval(processNextLog, 3000);   // ดึง log ทุก 3 วินาที
+    setInterval(runAudit, 30000);        // audit ทุก 30 วินาที
 });
 
 const PORT = 3000;
 app.listen(PORT, () => {
-    console.log(`🛡️ Server Running (Port ${PORT}) 🛡️`);
+    console.log(`🛡️ Server Running (Port ${PORT}) — Row-by-Row Hash Chaining 🛡️`);
 });
