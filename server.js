@@ -4,6 +4,7 @@ const mysql = require('mysql2/promise');
 const { ethers } = require('ethers');
 const crypto = require('crypto');
 const cors = require('cors');
+const { execSync } = require('child_process');
 
 const app = express();
 app.use(express.json());
@@ -76,15 +77,19 @@ const abi = [
 ];
 const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, wallet);
 
+// ===== Config =====
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 20;
+
 // ===== State =====
 let lastProcessedTime = '1970-01-01 00:00:00';
 let currentGroupNumber = 1;
-let currentRowIndex = 0;      // 0 = ยังไม่มีแถวในกลุ่มนี้, 1-20 = แถวล่าสุดที่ใส่
+let currentRowIndex = 0;
 let previousHash = '0000000000000000000000000000000000000000000000000000000000000000';
 let isProcessing = false;
 let isAuditing = false;
+let serverRunning = true;
 
-// ===== External Log Queue (สำหรับ /api/ingest) =====
+// ===== External Log Queue (สำหรับ /api/ingest + Windows Event Log) =====
 let externalQueue = [];
 
 // 1. เริ่มต้น Server: สร้างตาราง + ดึง state ล่าสุด
@@ -120,8 +125,7 @@ async function initServer() {
             previousHash = last.current_hash;
             lastProcessedTime = last.event_time;
 
-            if (last.row_index >= 20) {
-                // กลุ่มเดิมครบ 20 แล้ว → เริ่มกลุ่มใหม่
+            if (last.row_index >= BATCH_SIZE) {
                 currentGroupNumber = last.group_number + 1;
                 currentRowIndex = 0;
             } else {
@@ -130,16 +134,16 @@ async function initServer() {
             }
         }
 
-        console.log(`🕒 ระบบพร้อม! Group: ${currentGroupNumber}, Row: ${currentRowIndex}/20, เฝ้าระวัง Log ต่อจาก: ${lastProcessedTime}`);
+        console.log(`🕒 ระบบพร้อม! Group: ${currentGroupNumber}, Row: ${currentRowIndex}/${BATCH_SIZE}, เฝ้าระวัง Log ต่อจาก: ${lastProcessedTime}`);
     } catch (error) {
         console.error("❌ เชื่อมต่อฐานข้อมูลไม่ได้:", error.message);
         process.exit(1);
     }
 }
 
-// 2. ดึง Log 1 ตัว → Hash Chain → INSERT → ครบ 20 ส่ง Blockchain
+// 2. ดึง Log 1 ตัว → Hash Chain → INSERT → ครบ BATCH_SIZE ส่ง Blockchain
 async function processNextLog() {
-    if (isProcessing) return;
+    if (isProcessing || !serverRunning) return;
     try {
         isProcessing = true;
 
@@ -178,15 +182,15 @@ async function processNextLog() {
             [currentGroupNumber, currentRowIndex, logEntry.event_time, logEntry.source, logEntry.content, currentHash]
         );
 
-        console.log(`🔗 Group ${currentGroupNumber} | Row ${currentRowIndex}/20 | Hash: ${currentHash.substring(0, 16)}...`);
+        console.log(`🔗 Group ${currentGroupNumber} | Row ${currentRowIndex}/${BATCH_SIZE} | Hash: ${currentHash.substring(0, 16)}...`);
 
         previousHash = currentHash;
         lastProcessedTime = logEntry.event_time;
 
-        // ===== ครบ 20 → ส่ง Blockchain =====
-        if (currentRowIndex >= 20) {
+        // ===== ครบ BATCH_SIZE → ส่ง Blockchain =====
+        if (currentRowIndex >= BATCH_SIZE) {
             const blockId = `GROUP_${currentGroupNumber}`;
-            console.log(`🚀 ครบ 20 แถว! กำลังส่ง ${blockId} ขึ้น Blockchain...`);
+            console.log(`🚀 ครบ ${BATCH_SIZE} แถว! กำลังส่ง ${blockId} ขึ้น Blockchain...`);
 
             try {
                 const tx = await contract.addLog(blockId, currentHash);
@@ -194,8 +198,8 @@ async function processNextLog() {
 
                 // อัปเดตแถว anchor
                 await pool.execute(
-                    "UPDATE audit_ledger SET is_anchor = 1, tx_hash = ? WHERE group_number = ? AND row_index = 20",
-                    [tx.hash, currentGroupNumber]
+                    "UPDATE audit_ledger SET is_anchor = 1, tx_hash = ? WHERE group_number = ? AND row_index = ?",
+                    [tx.hash, currentGroupNumber, BATCH_SIZE]
                 );
 
                 console.log(`✅ ${blockId} บันทึกลง Blockchain สำเร็จ! TX: ${tx.hash}`);
@@ -263,7 +267,7 @@ async function runAudit() {
                     reHash = '0000000000000000000000000000000000000000000000000000000000000000';
                 } else {
                     const [prevAnchor] = await pool.execute(
-                        "SELECT current_hash FROM audit_ledger WHERE group_number = ? AND row_index = 20 LIMIT 1",
+                        "SELECT current_hash FROM audit_ledger WHERE group_number = ? AND is_anchor = 1 LIMIT 1",
                         [groupNum - 1]
                     );
                     reHash = prevAnchor.length > 0
@@ -492,13 +496,96 @@ app.get('/api/config', (req, res) => {
     res.json({ contractAddress: process.env.CONTRACT_ADDRESS, rpcUrl: process.env.RPC_URL });
 });
 
-// 8. เริ่มการทำงาน
+// 8. Windows Event Log Collector
+let lastWinLogTime = new Date(Date.now() - 60000).toISOString(); // เริ่มจาก 1 นาทีที่แล้ว
+const WIN_LOG_CHANNELS = ['Application', 'System', 'Security'];
+
+function collectWindowsLogs() {
+    if (!serverRunning) return;
+    if (process.platform !== 'win32') return;
+
+    for (const channel of WIN_LOG_CHANNELS) {
+        try {
+            const cmd = `powershell -Command "Get-WinEvent -LogName '${channel}' -MaxEvents 5 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt '${lastWinLogTime}' } | Select-Object TimeCreated, Id, LevelDisplayName, Message | ConvertTo-Json -Compress"`;
+            const output = execSync(cmd, { timeout: 10000, encoding: 'utf-8' });
+            if (!output || output.trim() === '') continue;
+
+            let events = JSON.parse(output);
+            if (!Array.isArray(events)) events = [events];
+
+            for (const evt of events) {
+                if (!evt.Message) continue;
+                externalQueue.push({
+                    event_time: new Date(evt.TimeCreated).toISOString().slice(0, 19).replace('T', ' '),
+                    source: `windows:${channel}`,
+                    content: `[${evt.LevelDisplayName || 'INFO'}] EventID:${evt.Id} | ${evt.Message.substring(0, 200)}`
+                });
+            }
+
+            if (events.length > 0) {
+                console.log(`🪟 Windows ${channel}: ดึง ${events.length} events (Queue: ${externalQueue.length})`);
+            }
+        } catch (e) {
+            // เงียบๆ ถ้า channel ไม่มีสิทธิ์หรือ error อื่น
+            if (!e.message.includes('No events')) {
+                // console.error(`Windows ${channel}:`, e.message);
+            }
+        }
+    }
+
+    lastWinLogTime = new Date().toISOString();
+}
+
+// 9. เริ่มการทำงาน
+let intervals = [];
+
 initServer().then(() => {
-    setInterval(processNextLog, 3000);   // ดึง log ทุก 3 วินาที
-    setInterval(runAudit, 30000);        // audit ทุก 30 วินาที
+    intervals.push(setInterval(processNextLog, 3000));
+    intervals.push(setInterval(runAudit, 30000));
+
+    // Windows Event Log ทุก 15 วินาที (เฉพาะ Windows)
+    if (process.platform === 'win32') {
+        intervals.push(setInterval(collectWindowsLogs, 15000));
+        collectWindowsLogs(); // รันครั้งแรกทันที
+        console.log(`🪟 Windows Event Log Collector เปิดใช้งาน (${WIN_LOG_CHANNELS.join(', ')})`);
+    }
+
+    console.log(`📊 Batch Size: ${BATCH_SIZE} logs/group`);
 });
 
 const PORT = 3000;
 app.listen(PORT, () => {
     console.log(`🛡️ Server Running (Port ${PORT}) — Row-by-Row Hash Chaining 🛡️`);
 });
+
+// 10. Graceful Shutdown
+function gracefulShutdown(signal) {
+    console.log(`\n⏹️ ได้รับสัญญาณ ${signal} — กำลังปิดอย่างปลอดภัย...`);
+    serverRunning = false;
+
+    // หยุด intervals ทั้งหมด
+    intervals.forEach(id => clearInterval(id));
+    console.log('✅ หยุด intervals แล้ว');
+
+    // รอ process ที่ค้างอยู่
+    const waitForFinish = setInterval(async () => {
+        if (!isProcessing && !isAuditing) {
+            clearInterval(waitForFinish);
+            console.log('✅ ไม่มีงานค้าง — ปิด DB connection...');
+            await pool.end();
+            console.log('✅ ปิดระบบเรียบร้อย! 👋');
+            process.exit(0);
+        } else {
+            console.log('⏳ รองานค้าง...');
+        }
+    }, 500);
+
+    // Timeout 10 วินาที force exit
+    setTimeout(() => {
+        console.error('❌ Timeout! Force exit.');
+        process.exit(1);
+    }, 10000);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

@@ -1,57 +1,94 @@
-# Sample Hardhat 3 Beta Project (`mocha` and `ethers`)
+# 🛡️ Log Blockchain — Row-by-Row Hash Chaining
 
-This project showcases a Hardhat 3 Beta project using `mocha` for tests and the `ethers` library for Ethereum interactions.
+ระบบตรวจสอบความถูกต้องของ MySQL Log โดยใช้ Hash Chain + Ethereum Blockchain เป็น Source of Truth
 
-To learn more about the Hardhat 3 Beta, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3 Beta](https://hardhat.org/hardhat3-beta-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+## สถาปัตยกรรม
 
-## Project Overview
-
-This example project includes:
-
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using `mocha` and ethers.js
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
-
-## Usage
-
-### Running Tests
-
-To run all the tests in the project, execute the following command:
-
-```shell
-npx hardhat test
+```
+mysql.general_log ──► ดึงทีละ 1 log ──► SHA-256 Hash Chain ──► INSERT audit_ledger
+                                                                       │
+                                                                  ครบ 20 แถว?
+                                                                   └─ ใช่ → ส่ง Hash ขึ้น Blockchain ⚓
+                                                                            เริ่ม Group ใหม่
 ```
 
-You can also selectively run the Solidity or `mocha` tests:
+- **Row-by-Row**: แต่ละ log = 1 แถว ใน `audit_ledger` พร้อม hash ที่ร้อยต่อจากแถวก่อนหน้า
+- **Anchor ทุก 20 แถว**: hash ตัวสุดท้าย ส่งขึ้น Ethereum Sepolia Smart Contract
+- **Audit ทุก 30 วินาที**: re-hash จาก `general_log` จริง → เทียบกับ Blockchain
 
-```shell
-npx hardhat test solidity
-npx hardhat test mocha
+## การตรวจจับ Tamper
+
+| สถานการณ์ | ผล |
+|---|---|
+| ลบ log ใน general_log | 🚨 จับได้ |
+| แก้ไข log ใน general_log | 🚨 จับได้ |
+| แก้/ลบ audit_ledger | 🚨 จับได้ (Blockchain เป็นตัวตัดสิน) |
+| แก้ทั้ง 2 ตาราง | 🚨 จับได้ (แก้ Blockchain ไม่ได้) |
+
+## ไฟล์หลัก
+
+| ไฟล์ | คำอธิบาย |
+|---|---|
+| `server.js` | Backend หลัก — hash chain, audit, API, LINE แจ้งเตือน |
+| `frontend/dashboard.html` | Dashboard แสดงผล + Report |
+| `contracts/LogStorage.sol` | Smart Contract บน Ethereum Sepolia |
+| `scripts/initialSync.js` | Sync log เก่าทั้งหมดเข้า audit_ledger + blockchain |
+
+## วิธีรัน
+
+### 1. ตั้งค่า `.env`
+```env
+DB_HOST=localhost
+DB_USER=root
+DB_PASS=1234
+DB_NAME=company_db
+CONTRACT_ADDRESS=0x...
+RPC_URL=https://eth-sepolia.g.alchemy.com/v2/...
+PRIVATE_KEY=...
+API_KEY=log-audit-secret-2024
+LINE_CHANNEL_TOKEN=          # (optional) LINE Messaging API
+LINE_USER_ID=                # (optional) ผู้รับแจ้งเตือน
 ```
 
-### Make a deployment to Sepolia
-
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
-
-To run the deployment to a local chain:
-
-```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
+### 2. ติดตั้ง Dependencies
+```bash
+npm install
 ```
 
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
-
-```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
+### 3. รัน Server
+```bash
+node server.js
 ```
 
-After setting the variable, you can run the deployment with the Sepolia network:
-
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
+### 4. Initial Sync (ถ้าต้องการ sync log เก่า)
+```bash
+npx hardhat run scripts/initialSync.js --network sepolia
 ```
+
+### 5. เปิด Dashboard
+เปิด `frontend/dashboard.html` ในเบราว์เซอร์
+
+## API Endpoints
+
+| Method | Path | คำอธิบาย |
+|---|---|---|
+| GET | `/api/get-status` | ข้อมูล audit_ledger + pagination |
+| GET | `/api/report` | Report เทียบ audit hash vs blockchain |
+| GET | `/api/config` | Contract address + RPC URL |
+| POST | `/api/ingest` | รับ log จากภายนอก (multi-source) |
+
+### ตัวอย่าง `/api/ingest`
+```bash
+curl -X POST http://localhost:3000/api/ingest \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: log-audit-secret-2024" \
+  -d '{"log_source": "nginx", "message": "GET /api 200"}'
+```
+
+## Tech Stack
+
+- **Backend**: Node.js, Express
+- **Database**: MySQL (`general_log` + `audit_ledger`)
+- **Blockchain**: Ethereum Sepolia, Solidity, ethers.js
+- **Frontend**: HTML, Tailwind CSS
+- **แจ้งเตือน**: LINE Messaging API
