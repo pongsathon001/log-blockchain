@@ -4,92 +4,118 @@ const crypto = require("crypto");
 require('dotenv').config();
 
 async function main() {
-    // เชื่อมต่อ Database
     const db = await mysql.createConnection({
         host: process.env.DB_HOST || 'localhost',
         user: process.env.DB_USER || 'root',
         password: process.env.DB_PASS || '1234',
         database: process.env.DB_NAME || 'company_db',
-        dateStrings: true 
+        dateStrings: true
     });
 
     const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
     if (!CONTRACT_ADDRESS) {
-        throw new Error("❌ หา CONTRACT_ADDRESS ไม่เจอ! ตรวจสอบไฟล์ .env ด่วน");
+        throw new Error("❌ หา CONTRACT_ADDRESS ไม่เจอ! ตรวจสอบไฟล์ .env");
     }
 
-    // 🌟 [แก้ปัญหา Hardhat ดื้อ] บังคับใส่ ABI ใหม่เข้าไปตรงๆ เลย
     const [signer] = await hre.ethers.getSigners();
     const abi = [
         "function addLog(string memory _id, string memory _hash) public",
         "function getLog(string memory _id) public view returns (string memory, uint256, address)"
     ];
-    const LogStorage = new hre.ethers.Contract(CONTRACT_ADDRESS, abi, signer);
+    const contract = new hre.ethers.Contract(CONTRACT_ADDRESS, abi, signer);
 
-    // 1. ดึง Log ทั้งหมดจาก general_log โดยกรอง Log ของระบบทิ้งไป
+    // สร้างตาราง audit_ledger ถ้ายังไม่มี
+    await db.execute(`
+        CREATE TABLE IF NOT EXISTS audit_ledger (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            group_number INT NOT NULL,
+            row_index INT NOT NULL,
+            event_time DATETIME(6) NOT NULL,
+            log_source VARCHAR(100) NOT NULL,
+            log_content TEXT NOT NULL,
+            current_hash VARCHAR(64) NOT NULL,
+            is_anchor TINYINT DEFAULT 0,
+            tx_hash VARCHAR(100),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_alert TINYINT DEFAULT 0,
+            tamper_first_detected_at DATETIME,
+            INDEX idx_group (group_number),
+            INDEX idx_event_time (event_time)
+        )
+    `);
+
+    // ดึง Log ทั้งหมดจาก general_log (กรองแค่ของระบบ audit)
     const [rows] = await db.execute(`
         SELECT event_time, user_host, argument 
         FROM mysql.general_log 
-        WHERE argument NOT LIKE '%general_log%' 
-          AND argument NOT LIKE '%audit_ledger%'
-          AND argument NOT LIKE '%performance_schema%'
-          AND argument NOT LIKE '%innodb%'
+        WHERE argument NOT LIKE '%audit_ledger%'
         ORDER BY event_time ASC
     `);
-    console.log(`📦 พบ Log ทั้งหมด ${rows.length} รายการ กำลังเริ่มการมัดรวมกลุ่มละ 20...`);
+    console.log(`📦 พบ Log ทั้งหมด ${rows.length} รายการ`);
 
-    // 2. วนลูปประมวลผลทีละ 20 รายการ (Inter-block Chaining)
-    let prevMasterHash = "0000000000000000000000000000000000000000000000000000000000000000";
-    
-    for (let i = 0; i < rows.length; i += 20) {
-        const chunk = rows.slice(i, i + 20);
-        
-        if (chunk.length === 20) {
-            const blockNum = (i / 20) + 1;
-            console.log(`\n⛓️ กำลังประมวลผล Block #${blockNum} (Logs ${i + 1} - ${i + 20}) และร้อยโซ่ Hash...`);
+    if (rows.length === 0) {
+        console.log("⚠️ ไม่มี Log ให้ประมวลผล");
+        await db.end();
+        return;
+    }
 
-            // ลอจิกการร้อยโซ่ Hash โดยใช้ master_hash ของ block ก่อนหน้าเป็น seed + row index
-            let currentHash = prevMasterHash;
-            chunk.forEach((log, idx) => {
-                const dataString = `${idx}${log.event_time}${log.user_host}${log.argument}${currentHash}`;
-                currentHash = crypto.createHash("sha256").update(dataString).digest("hex");
-            });
+    // Row-by-Row Hash Chaining
+    let previousHash = '0000000000000000000000000000000000000000000000000000000000000000';
+    let groupNumber = 1;
+    let rowIndex = 0;
 
-            const masterHash = currentHash; 
-            const rawContent = JSON.stringify(chunk);
+    for (let i = 0; i < rows.length; i++) {
+        const log = rows[i];
+        rowIndex++;
+
+        const content = `${log.user_host} | ${log.argument}`;
+        const dataString = `${rowIndex}${log.event_time}general_log${content}${previousHash}`;
+        const currentHash = crypto.createHash('sha256').update(dataString).digest('hex');
+
+        // INSERT 1 แถว
+        await db.execute(
+            `INSERT INTO audit_ledger (group_number, row_index, event_time, log_source, log_content, current_hash) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [groupNumber, rowIndex, log.event_time, 'general_log', content, currentHash]
+        );
+
+        console.log(`🔗 Group ${groupNumber} | Row ${rowIndex}/20 | Hash: ${currentHash.substring(0, 16)}...`);
+        previousHash = currentHash;
+
+        // ครบ 20 → ส่ง Blockchain
+        if (rowIndex >= 20) {
+            const blockId = `GROUP_${groupNumber}`;
+            console.log(`🚀 ส่ง ${blockId} ขึ้น Blockchain...`);
 
             try {
-                // บันทึกลง DB
-                const [result] = await db.execute(
-                    "INSERT INTO audit_ledger (sequence_start_time, sequence_end_time, log_count, raw_logs_content, master_hash) VALUES (?, ?, ?, ?, ?)",
-                    [chunk[0].event_time, chunk[19].event_time, 20, rawContent, masterHash]
-                );
-
-                // ส่ง Master Hash ขึ้น Blockchain
-                const blockId = `BLOCK_${result.insertId}`;
-                console.log(`🚀 ส่ง ${blockId} ขึ้น Blockchain...`);
-                
-                const tx = await LogStorage.addLog(blockId, masterHash);
+                const tx = await contract.addLog(blockId, currentHash);
                 await tx.wait();
 
-                console.log(`✅ สำเร็จ: ${blockId} | TX: ${tx.hash}`);
-                prevMasterHash = masterHash; // อัปเดต seed สำหรับ block ถัดไป
+                await db.execute(
+                    "UPDATE audit_ledger SET is_anchor = 1, tx_hash = ? WHERE group_number = ? AND row_index = 20",
+                    [tx.hash, groupNumber]
+                );
+
+                console.log(`✅ ${blockId} สำเร็จ! TX: ${tx.hash}`);
+                groupNumber++;
+                rowIndex = 0;
             } catch (err) {
-                console.error(`❌ ผิดพลาดที่ Block #${blockNum}:`, err.message);
-                // ถ้า blockchain fail ลบข้อมูลออกจาก DB
-                try { await db.execute("DELETE FROM audit_ledger WHERE master_hash = ?", [masterHash]); } catch {}
-                break; // หยุดเพราะ chain จะเสีย
+                console.error(`❌ Blockchain fail ที่ ${blockId}:`, err.message);
+                await db.execute("DELETE FROM audit_ledger WHERE group_number = ?", [groupNumber]);
+                break;
             }
-        } else {
-            console.log(`\n⚠️ เศษที่เหลือ ${chunk.length} รายการ จะถูกประมวลผลโดย server.js เมื่อมี Log ใหม่เข้ามาครบ 20`);
         }
     }
 
-    console.log(`\n✨ Initial Sync เสร็จสมบูรณ์! ข้อมูลเก่าถูกร้อยโซ่และประทับตราบน Blockchain เรียบร้อย`);
+    if (rowIndex > 0 && rowIndex < 20) {
+        console.log(`\n⚠️ เศษที่เหลือ ${rowIndex} รายการ (Group ${groupNumber}) จะถูกประมวลผลต่อโดย server.js`);
+    }
+
+    console.log(`\n✨ Initial Sync เสร็จสมบูรณ์!`);
     await db.end();
 }
 
-main().catch((error) => { 
-    console.error("❌ เกิดข้อผิดพลาดร้ายแรง:", error); 
-    process.exitCode = 1; 
+main().catch((error) => {
+    console.error("❌ เกิดข้อผิดพลาด:", error);
+    process.exitCode = 1;
 });

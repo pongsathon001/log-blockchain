@@ -9,6 +9,42 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// ===== LINE Messaging API =====
+const LINE_CHANNEL_TOKEN = process.env.LINE_CHANNEL_TOKEN;
+const LINE_USER_ID = process.env.LINE_USER_ID;
+const notifiedGroups = new Set(); // ป้องกันแจ้งซ้ำ
+
+async function sendLineAlert(groupNum, auditHash, blockchainHash) {
+    if (!LINE_CHANNEL_TOKEN || !LINE_USER_ID) return;
+    if (notifiedGroups.has(groupNum)) return; // แจ้งแล้วไม่แจ้งซ้ำ
+
+    const message = `🚨 SECURITY ALERT 🚨\n\nพบการดัดแปลง Log!\n📦 Group: ${groupNum}\n🔑 Audit Hash: ${auditHash.substring(0, 20)}...\n⛓️ Blockchain Hash: ${blockchainHash.substring(0, 20)}...\n⏰ เวลา: ${new Date().toLocaleString('th-TH')}\n\n⚠️ Log ในฐานข้อมูลไม่ตรงกับ Blockchain!`;
+
+    try {
+        const res = await fetch('https://api.line.me/v2/bot/message/push', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${LINE_CHANNEL_TOKEN}`
+            },
+            body: JSON.stringify({
+                to: LINE_USER_ID,
+                messages: [{ type: 'text', text: message }]
+            })
+        });
+
+        if (res.ok) {
+            notifiedGroups.add(groupNum);
+            console.log(`📱 LINE แจ้งเตือน Group ${groupNum} สำเร็จ!`);
+        } else {
+            const err = await res.json();
+            console.error(`❌ LINE Error:`, err.message || JSON.stringify(err));
+        }
+    } catch (e) {
+        console.error(`❌ LINE ส่งไม่ได้:`, e.message);
+    }
+}
+
 // Middleware ตรวจสอบ API Key
 const API_KEY = process.env.API_KEY;
 function authMiddleware(req, res, next) {
@@ -287,6 +323,7 @@ async function runAudit() {
                         [groupNum]
                     );
                     console.log(`🚨 ALERT: Group ${groupNum} — hash ไม่ตรงกับ Blockchain!`);
+                    await sendLineAlert(groupNum, reHash, onChain[0]);
                 } else {
                     await pool.execute(
                         "UPDATE audit_ledger SET is_alert = 0 WHERE group_number = ?",
