@@ -113,10 +113,7 @@ async function processNextLog() {
         const [logs] = await pool.execute(
             `SELECT event_time, user_host, argument FROM mysql.general_log 
              WHERE event_time > ? 
-               AND argument NOT LIKE '%general_log%' 
-               AND argument NOT LIKE '%audit_ledger%' 
-               AND argument NOT LIKE '%performance_schema%'
-               AND argument NOT LIKE '%innodb%'
+               AND argument NOT LIKE '%audit_ledger%'
              ORDER BY event_time ASC LIMIT 1`, [lastProcessedTime]
         );
 
